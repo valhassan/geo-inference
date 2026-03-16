@@ -17,14 +17,33 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
 ]
 keywords = ["pytorch", "deep learning", "machine learning", "remote sensing", "satellite imagery", "earth observation", "geospatial"]
-dynamic = ["dependencies","version",]
-requires-python = ">=3.9"
+dynamic = ["version"]
+requires-python = ">=3.12.0,<3.13"
+
+dependencies = [
+    "numpy>=2.3.0,<2.4.0",
+    "pandas>=2.3.0,<2.4.0",
+    "scipy>=1.13.1,<1.18.0",
+    "rasterio>=1.4.0,<1.5.0",
+    "rioxarray>=0.15.6,<0.23.0",
+    "xarray>=2024.6.0,<2027.1.0",
+    "kornia>=0.8.0,<0.9.0",
+    "pystac>=1.10.1,<1.15.0",
+    "requests>=2.32.3,<2.33.0",
+    "PyYAML>=6.0.0,<7.0.0",
+    "dask[distributed]>=2024.6.2,<2027.1.0",
+    "tqdm>=4.67.1,<5.0.0",
+]
 
 [tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
 version = {file = ["VERSION"]}
 
+
 [project.optional-dependencies]
+cu128 = [
+  "torch>=2.8.0,<2.9.0",
+  "torchvision>=0.23.0,<0.24.0",
+]
 dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
 
 [project.urls]
