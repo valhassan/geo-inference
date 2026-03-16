@@ -1,23 +1,29 @@
-
-
-import torch
-import logging
-from typing import Union, Optional
 import json
+import logging
 from pathlib import Path
+from typing import Optional, Union
+
 import numpy as np
 import scipy.signal.windows as w
-from scipy.special import expit
+import torch
 from rasterio.transform import Affine
+
+from .utils.tta import geometric_tta, radiometric_tta
+
 logger = logging.getLogger(__name__)
+
 
 def runModel(
     chunk_data: np.ndarray,
     model,
+    ordered_input: list,
     patch_size: int,
     device: str,
     no_data: Optional[float],
     num_classes: int = 5,
+    use_geometric_tta: bool = False,
+    use_radiometric_tta: bool = False,
+    max_tta_batch: int = 4,
     block_info=None,
 ):
     """
@@ -26,7 +32,8 @@ def runModel(
     This window is used for edge artifact.
     @param chunk_data: np.ndarray, this is a chunk of data in dask array
             chunk_size: int, the size of chunk data that we want to feed the model with
-            model: ScrptedModel, the scripted model.
+            model: ExportModule, the exported model.
+            ordered_input: list, the ordered input for the model.
             patch_size: int , the size of each patch on which the model should be run.
             device : str, the torch device; either cpu or gpu.
             no_data: Optional[float], the no data value.
@@ -42,13 +49,20 @@ def runModel(
 
     if (
         (no_data is None and not np.isfinite(chunk_data).any())
-        or (no_data is not None and np.isnan(no_data) and not np.isfinite(chunk_data).any())
-        or (no_data is not None and not np.isnan(no_data) and np.all(chunk_data == no_data))
+        or (
+            no_data is not None
+            and np.isnan(no_data)
+            and not np.isfinite(chunk_data).any()
+        )
+        or (
+            no_data is not None
+            and not np.isnan(no_data)
+            and np.all(chunk_data == no_data)
+        )
     ):
         return np.zeros((num_classes + 1, patch_size, patch_size))
-    
+
     try:
-        
         # Defining the base window for window creation later
         step = patch_size >> 1
         window = w.hann(M=patch_size, sym=False)
@@ -181,15 +195,66 @@ def runModel(
         ):
             final_window = window
 
-        tensor = torch.as_tensor(chunk_data[np.newaxis, ...]).to(
-            torch.device(device)
-        )
-        out = np.empty(
-            shape=(num_classes, chunk_data.shape[1], chunk_data.shape[2])
-        )  # Create the output but empty
-        with torch.no_grad():
-            out = model(tensor).cpu().numpy()[0]
-        del tensor
+        tensor = torch.as_tensor(chunk_data, device=torch.device(device))
+        if tensor.ndim == 3:
+            tensor = tensor.unsqueeze(0)
+
+        if ordered_input:
+            extra_inputs = [
+                torch.as_tensor(extra_input, device=torch.device(device))
+                for extra_input in ordered_input
+            ]
+        else:
+            extra_inputs = []
+
+        # Each branch can have geometric TTA (flips/rotations) or identity only.
+        tta_pairs: list = []
+        # Raw branch
+        if use_geometric_tta:
+            tta_pairs.extend(geometric_tta(tensor))
+        else:
+            tta_pairs.append((tensor, lambda y: y))
+        # CLAHE branch (only if radiometric TTA enabled)
+        if use_radiometric_tta:
+            tensor_clahe = radiometric_tta(tensor)
+            if use_geometric_tta:
+                tta_pairs.extend(geometric_tta(tensor_clahe))
+            else:
+                tta_pairs.append((tensor_clahe, lambda y: y))
+
+        acc: Optional[torch.Tensor] = None
+        count = 0
+
+        for i in range(0, len(tta_pairs), max_tta_batch):
+            batch_pairs = tta_pairs[i : i + max_tta_batch]
+            batch_x = torch.cat([p[0] for p in batch_pairs], dim=0)
+
+            with torch.no_grad():
+                if extra_inputs:
+                    y = model(batch_x, *extra_inputs)
+                else:
+                    y = model(batch_x)
+
+            outs = []
+            for j, (_, inv) in enumerate(batch_pairs):
+                y_j = inv(y[j : j + 1])
+                outs.append(y_j)
+
+            y_inv = torch.cat(outs, dim=0).float()
+
+            if acc is None:
+                acc = y_inv.sum(dim=0, keepdim=True)
+            else:
+                acc = acc + y_inv.sum(dim=0, keepdim=True)
+
+            count += len(batch_pairs)
+
+        if acc is None or count == 0:
+            return np.zeros((num_classes + 1, patch_size, patch_size))
+
+        mean_pred = (acc / float(count))[0]
+        out = mean_pred.detach().cpu().numpy()
+
         if out.shape[1:] == final_window.shape and out.shape[1:] == (
             patch_size,
             patch_size,
@@ -210,7 +275,7 @@ def runModel(
 def sum_overlapped_chunks(
     aoi_chunk: np.ndarray,
     chunk_size: int,
-    prediction_threshold : float = 0.3,
+    prediction_threshold: float = 0.3,
     block_info=None,
 ):
     """
@@ -313,38 +378,46 @@ def sum_overlapped_chunks(
                 )
                 if final_result.shape[0] == 1:
                     final_result = (
-                        np.where(final_result > prediction_threshold, 1, 0).squeeze(0).astype(np.uint8)
+                        np.where(final_result > prediction_threshold, 1, 0)
+                        .squeeze(0)
+                        .astype(np.uint8)
                     )
                 else:
                     final_result = np.argmax(final_result, axis=0).astype(np.uint8)
                 return final_result
 
 
-def read_zarr_metadata(
-    metadata_json: Union[Path, str]
-):
+def read_zarr_metadata(metadata_json: Union[Path, str]):
     try:
-        with open(metadata_json, 'r') as metadat_json:
+        with open(metadata_json, "r") as metadat_json:
             metadata = json.load(metadat_json)
-            lines = metadata['transform'].strip().split('\n')
+            lines = metadata["transform"].strip().split("\n")
             matrix_values = []
             for line in lines:
-                values = line.strip('|').split(',')
+                values = line.strip("|").split(",")
                 matrix_values.extend(float(val.strip()) for val in values)
             # Create and return the Affine object
-            trs = Affine(matrix_values[0], matrix_values[1], matrix_values[2],
-                        matrix_values[3], matrix_values[4], matrix_values[5])
-            metadata.update({
-                'crs': metadata['crs'],
-                'transform': trs,
-                'count': metadata['count'],
-                'width': metadata['width'],
-                'height': metadata['height'],
-                'driver': metadata['driver'],
-                'dtype': metadata['dtype'],
-                'BIGTIFF': metadata.get('BIGTIFF', 'Unknown'),
-                'compress': metadata.get('compress', 'Unknown')
-            })
+            trs = Affine(
+                matrix_values[0],
+                matrix_values[1],
+                matrix_values[2],
+                matrix_values[3],
+                matrix_values[4],
+                matrix_values[5],
+            )
+            metadata.update(
+                {
+                    "crs": metadata["crs"],
+                    "transform": trs,
+                    "count": metadata["count"],
+                    "width": metadata["width"],
+                    "height": metadata["height"],
+                    "driver": metadata["driver"],
+                    "dtype": metadata["dtype"],
+                    "BIGTIFF": metadata.get("BIGTIFF", "Unknown"),
+                    "compress": metadata.get("compress", "Unknown"),
+                }
+            )
             return metadata
     except FileNotFoundError:
         logging.error(f"Error: The file '{metadata_json}' was not found.")
