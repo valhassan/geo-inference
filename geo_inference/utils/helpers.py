@@ -3,31 +3,37 @@ import logging
 import os
 import re
 import tarfile
-import rasterio
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
+
+import csv
+import pystac
+import rasterio
 import requests
 import torch
 import yaml
-
-import csv
-from tqdm import tqdm
-from typing import Dict, Union
-from hydra.utils import to_absolute_path
 from pandas.io.common import is_url
-from collections import OrderedDict
-import pystac
 from pystac.extensions.eo import Band
-from pathlib import Path
-
-
-from ..config.logging_config import logger
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 USER_CACHE = Path.home().joinpath(".cache")
 script_dir = Path(__file__).resolve().parent.parent
 MODEL_CONFIG = script_dir / "config" / "models.yaml"
+
+
+def to_absolute_path(path: str | Path) -> Path:
+    """Return an absolute path without relying on Hydra.
+
+    If ``path`` is already absolute, it is returned as-is. Otherwise, it is
+    interpreted as relative to the current working directory.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return (Path.cwd() / p).resolve()
 
 
 def is_tiff_path(path: str):
@@ -302,7 +308,7 @@ def xarray_profile_info(
 
 
 def get_tiff_paths_from_csv(
-    csv_path: Union[str, Path],
+    csv_path: str | Path,
 ):
     """
     Creates list of to-be-processed tiff files from a csv file referencing input data
@@ -332,7 +338,7 @@ def get_tiff_paths_from_csv(
     return aois_dictionary
 
 
-def asset_by_common_name(raster_raw_input) -> Dict:
+def asset_by_common_name(raster_raw_input) -> dict:
     """
     Get assets by common band name (only works for assets containing 1 band)
     Adapted from:
@@ -363,7 +369,7 @@ def asset_by_common_name(raster_raw_input) -> Dict:
     return _assets_by_common_name
 
 
-def read_csv(csv_file_name: str) -> Dict:
+def read_csv(csv_file_name: str) -> list[dict]:
     """
     Open csv file and parse it, returning a list of dictionaries with keys:
     - "tif": path to a single image
@@ -456,6 +462,14 @@ def cmd_interface(argv=None):
         "-i", "--image", nargs=1, help="Path or URL to the input image"
     )
 
+    parser.add_argument(
+        "-s",
+        "--sensor_name",
+        nargs=1,
+        default=None,
+        help="Sensor key for model metadata (e.g. geoeye-1-rgbn). Required if model has metadata.",
+    )
+
     parser.add_argument("-m", "--model", nargs=1, help="Path or URL to the model file")
 
     parser.add_argument("-wd", "--work_dir", nargs=1, help="Working Directory")
@@ -480,9 +494,8 @@ def cmd_interface(argv=None):
     
     parser.add_argument("-pr", "--prediction_thr", type=float, nargs=1, help="Prediction Threshold")
     
-    parser.add_argument("-tr", "--transformers", nargs=1, help="Transformers Addition")
-    parser.add_argument("-tr_f", "--transformer_flip", nargs=1, help="Transformers Addition - Flip")
-    parser.add_argument("-tr_e", "--transformer_rotate", nargs=1, help="Transformers Addition - Rotate")
+    parser.add_argument("-gtta", "--geometric_tta", nargs=1, help="Geometric TTA")
+    parser.add_argument("-rtta", "--radiometric_tta", nargs=1, help="Radiometric TTA")
     
     args = parser.parse_args()
 
@@ -503,9 +516,9 @@ def cmd_interface(argv=None):
         classes = config["arguments"]["classes"]
         patch_size = config["arguments"]["patch_size"]
         prediction_threshold = config["arguments"]["prediction_thr"]
-        transformers = config["arguments"]["transformers"]
-        transformer_flip = config["arguments"]["transformer_flip"]
-        transformer_rotate = config["arguments"]["transformer_rotate"]
+        geometric_tta = config["arguments"]["geometric_tta"]
+        radiometric_tta = config["arguments"]["radiometric_tta"]
+        sensor_name = config["arguments"].get("sensor_name")
 
     elif args.image:
         image =args.image[0]
@@ -523,10 +536,10 @@ def cmd_interface(argv=None):
         classes = args.classes[0] if args.classes else 5
         patch_size = args.patch_size[0] if args.patch_size else 1024 
         prediction_threshold = args.prediction_thr[0] if args.prediction_thr else 0.3
-        transformers = args.transformers[0] if args.transformers else False
-        transformer_flip = args.transformer_flip if args.transformer_flip else False
-        transformer_rotate = args.transformer_rotate if args.transformer_rotate else False
-    
+        geometric_tta = args.geometric_tta[0] if args.geometric_tta else False
+        radiometric_tta = args.radiometric_tta[0] if args.radiometric_tta else False
+        sensor_name = args.sensor_name[0] if args.sensor_name else None
+
     else:
         print("use the help [-h] option for correct usage")
         raise SystemExit
@@ -546,9 +559,9 @@ def cmd_interface(argv=None):
         "gpu_id": gpu_id,
         "patch_size": patch_size,
         "prediction_threshold": prediction_threshold,
-        "transformers": transformers,
-        "transformer_flip": transformer_flip,
-        "transformer_rotate":transformer_rotate,
+        "geometric_tta": geometric_tta,
+        "radiometric_tta": radiometric_tta,
+        "sensor_name": sensor_name,
     }
     return arguments
 
