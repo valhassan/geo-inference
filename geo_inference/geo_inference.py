@@ -1,54 +1,48 @@
-import os
-import gc
-import re
-import sys
-import uuid
-import platform
-import time
-import torch
-import pystac
-import logging
 import asyncio
-import rasterio
+import gc
+import json
+import logging
+import os
+import platform
+import re
 import threading
-import numpy as np
-import xarray as xr
-import rioxarray
-import ttach as tta
-from typing import Dict
-from dask import config
-import dask.array as da
-from pathlib import Path
-from omegaconf import ListConfig 
-from rasterio.windows import from_bounds
-from rasterio.transform import from_origin
-from typing import Union, Sequence, List
-from dask.diagnostics import ProgressBar
+import time
+import uuid
 from multiprocessing.pool import ThreadPool
+from pathlib import Path
+from typing import List, Union
 
+import dask.array as da
+import numpy as np
+import pystac
+import rasterio
+import rioxarray
+import torch
+import xarray as xr
+from dask import config
+from dask.diagnostics import ProgressBar
+from rasterio.transform import from_origin
+from rasterio.windows import from_bounds
 
+from .geo_dask import (
+    read_zarr_metadata,
+    runModel,
+    sum_overlapped_chunks,
+)
 from .utils.helpers import (
+    asset_by_common_name,
     cmd_interface,
     get_directory,
     get_model,
-    xarray_profile_info,
     select_model_device,
-    asset_by_common_name,
+    xarray_profile_info,
 )
-from .geo_dask import (
-    runModel,
-    read_zarr_metadata,
-    sum_overlapped_chunks,
-)
-
-from .utils.polygon import gdf_to_yolo, mask_to_poly_geojson, geojson2coco
-
+from .utils.polygon import gdf_to_yolo, geojson2coco, mask_to_poly_geojson
+from config import logging_config # noqa: F401
 logger = logging.getLogger(__name__)
 
 
-
 class GeoInference:
-    
     """
     A class for performing geo inference on geospatial imagery using a pre-trained model.
 
@@ -63,9 +57,8 @@ class GeoInference:
         gpu_id (int): The ID of the GPU to use for inference (if device is "gpu").
         num_classes (int) : The number of classes in the output of the model.
         prediction_threshold (float): Prediction probability Threshold (fraction of 1) to use.
-        transformers (bool): Allow Test-time augmentations.
-        transformer_flip (bool): Perform horizontal and vertical flips.
-        transformer_rotate (bool): Perform 90 degree rotation.
+        geometric_tta (bool): Whether to perform geometric test-time augmentations.
+        radiometric_tta (bool): Whether to perform radiometric test-time augmentations.
 
     Attributes:
         work_dir (Path): The directory where the model and output files will be saved.
@@ -90,91 +83,87 @@ class GeoInference:
         multi_gpu: bool = False,
         gpu_id: int = 0,
         num_classes: int = 5,
-        prediction_threshold : float = 0.3,
-        transformers : bool = False,
-        transformer_flip: bool = False,
-        transformer_rotate: bool = False,
+        prediction_threshold: float = 0.3,
+        geometric_tta: bool = False,
+        radiometric_tta: bool = False,
     ):
         self.work_dir: Path = get_directory(work_dir)
         self.device = select_model_device(gpu_id, multi_gpu, device)
-        
-        self.model = torch.jit.load(
-            get_model(
-                model_path_or_url=model,
-                work_dir=self.work_dir,
-            ),
-            map_location=self.device,
+
+        extra_files = {"metadata.json": ""}
+        self.model = (
+            torch.export.load(
+                get_model(
+                    model_path_or_url=model,
+                    work_dir=self.work_dir,
+                ),
+                extra_files=extra_files,
+            )
+            .module()
+            .to(self.device)
         )
-        if transformers:
-            if transformer_flip and transformer_rotate:    # do all
-                transforms = tta.aliases.d4_transform()
-            elif transformer_rotate:                       # do rotate only
-                transforms = tta.Compose(
-                    [
-                        tta.Rotate90(angles=[90]),
-                    ]
-                )
-            elif transformer_flip:                         # do flip only
-                transforms = tta.Compose(
-                    [
-                        tta.HorizontalFlip(),
-                        tta.VerticalFlip(),
-                    ]
-                )
-            self.model = tta.SegmentationTTAWrapper(self.model, transforms, merge_mode='mean')
+        metadata = extra_files.get("metadata.json", "").strip()
+        self.metadata = json.loads(metadata) if metadata else None
         self.mask_to_vec = mask_to_vec
         self.mask_to_coco = mask_to_coco
         self.mask_to_yolo = mask_to_yolo
         self.classes = num_classes
         self.prediction_threshold = prediction_threshold
+        self.geometric_tta = geometric_tta
+        self.radiometric_tta = radiometric_tta
         self.raster_meta = None
 
     @torch.no_grad()
     def __call__(
         self,
         inference_input: Union[Path, str],
+        sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
         workers: int = 0,
         bbox: str = None,
     ) -> str:
-        
+
         async def run_async():
-            
+
             # Start the periodic garbage collection task
-            self.gc_task = asyncio.create_task(self.constant_gc(5))  # Calls gc.collect() every 5 seconds
+            self.gc_task = asyncio.create_task(
+                self.constant_gc(5)
+            )  # Calls gc.collect() every 5 seconds
             # Run the main computation asynchronously
             self.mask_layer_name = await self.async_run_inference(
                 inference_input=inference_input,
+                sensor_name=sensor_name,
                 bands_requested=bands_requested,
                 patch_size=patch_size,
                 workers=workers,
-                bbox=bbox
+                bbox=bbox,
             )
             self.gc_task.cancel()
-            
+
             try:
                 await self.gc_task
             except asyncio.CancelledError:
                 pass
-        
+
         asyncio.run(run_async())
         return self.mask_layer_name
-        
 
-    async def async_run_inference(self,
+    async def async_run_inference(
+        self,
         inference_input: Union[Path, str],
+        sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
         workers: int = 0,
         bbox: str = None,
     ) -> None:
-        
         """
         Perform geo inference on geospatial imagery using dask array.
 
         Args:
             inference_input Union[Path, str]: The path/url to the geospatial image to perform inference on.
+            sensor_name (str): The name of the sensor to use for the inference.
             bands_requested List[str]: The requested bands to consider for the inference.
             patch_size (int): The size of the patches to use for inference.
             workers (int): Number of workers used by dask, Default = Nb of cores available on the host, minus 1.
@@ -184,23 +173,23 @@ class GeoInference:
             None
 
         """
-        
+
         # configuring dask with proper number of workers, alternatively we could also use os.getenv('SLURM_CPUS_PER_TASK')
         if workers != 0:
             num_workers = workers
-        elif 'linux' in platform.uname().system.lower():
+        elif "linux" in platform.uname().system.lower():
             num_workers = len(os.sched_getaffinity(0)) - 1
         else:
-            num_workers = os.cpu_count() - 1    
+            num_workers = os.cpu_count() - 1
         print(f"running dask with {num_workers} workers")
-        config.set(scheduler='threads', num_workers=num_workers)
+        config.set(scheduler="threads", num_workers=num_workers)
         config.set(pool=ThreadPool(num_workers))
-        
+
         if not isinstance(inference_input, (str, Path)):
             raise TypeError(
                 f"Invalid raster type.\nGot {inference_input} of type {type(inference_input)}"
             )
-        if not isinstance(bands_requested, (List, ListConfig)):
+        if not isinstance(bands_requested, (List)):
             raise ValueError(
                 f"Requested bands should be a list."
                 f"\nGot {bands_requested} of type {type(bands_requested)}"
@@ -220,11 +209,15 @@ class GeoInference:
             base_name if not base_name.endswith(".tif") else base_name[:-4]
         )
         prefix_base_name = (
-            prefix_base_name if not prefix_base_name.endswith(".zarr") else base_name[:-5]
+            prefix_base_name
+            if not prefix_base_name.endswith(".zarr")
+            else base_name[:-5]
         )
-        u_id = uuid.uuid4().hex[:6] 
+        u_id = uuid.uuid4().hex[:6]
         mask_path = self.work_dir.joinpath(prefix_base_name + f"_mask_{u_id}.tif")
-        polygons_path = self.work_dir.joinpath(prefix_base_name + f"_polygons_{u_id}.geojson")
+        polygons_path = self.work_dir.joinpath(
+            prefix_base_name + f"_polygons_{u_id}.geojson"
+        )
         yolo_csv_path = self.work_dir.joinpath(prefix_base_name + f"_yolo_{u_id}.csv")
         coco_json_path = self.work_dir.joinpath(prefix_base_name + f"_coco_{u_id}.json")
         stride_patch_size = int(patch_size / 2)
@@ -247,43 +240,61 @@ class GeoInference:
             if not raster_stac_item:
                 inference_input_path = Path(inference_input)
                 if os.path.splitext(inference_input_path)[1].lower() == ".zarr":
-                    aoi_dask_array = da.from_zarr(inference_input, chunks=(1, stride_patch_size, stride_patch_size))
-                    meta_data_json = re.sub(r'\.zarr$', '', inference_input)
+                    aoi_dask_array = da.from_zarr(
+                        inference_input,
+                        chunks=(1, stride_patch_size, stride_patch_size),
+                    )
+                    meta_data_json = re.sub(r"\.zarr$", "", inference_input)
                     self.json = read_zarr_metadata(f"{meta_data_json}.json")
                 else:
-                    with rasterio.open(inference_input, "r") as src:
-                        self.raster_meta = src.meta
-                        self.raster = src
-                        self.no_data = src.nodata
-                        self.input_dtype = src.dtypes[0]
-                    
-                    aoi_dask_array = rioxarray.open_rasterio(inference_input, chunks=(1, stride_patch_size, stride_patch_size))
+                    aoi_dask_array = rioxarray.open_rasterio(
+                        inference_input,
+                        chunks=(1, stride_patch_size, stride_patch_size),
+                    )
+                    self.raster_meta = {
+                        "driver": "GTiff",
+                        "crs": aoi_dask_array.rio.crs,
+                        "transform": aoi_dask_array.rio.transform(),
+                        "width": int(aoi_dask_array.rio.width),
+                        "height": int(aoi_dask_array.rio.height),
+                        "dtype": aoi_dask_array.dtype,
+                    }
+                    self.no_data = aoi_dask_array.rio.nodata
+                    self.input_dtype = aoi_dask_array.dtype
 
                 try:
                     if bands_requested:
-                        if (
-                            len(bands_requested) != 0
-                        ):
+                        if len(bands_requested) != 0:
                             if self.json is None:
                                 logger.info("Bands are reordeing to bands_requested:")
                                 aoi_dask_array = xr.concat(
-                                    [aoi_dask_array[int(i) - 1, :, :] for i in bands_requested],
-                                    dim="band"
+                                    [
+                                        aoi_dask_array[int(i) - 1, :, :]
+                                        for i in bands_requested
+                                    ],
+                                    dim="band",
                                 )
                             else:
                                 logger.info("Bands are reordeing to bands_requested:")
                                 aoi_dask_array = da.stack(
-                                    [aoi_dask_array[int(i) - 1, :, :] for i in bands_requested],
-                                    axis =0,
+                                    [
+                                        aoi_dask_array[int(i) - 1, :, :]
+                                        for i in bands_requested
+                                    ],
+                                    axis=0,
                                 )
                 except Exception as e:
                     raise e
             else:
                 assets = asset_by_common_name(inference_input)
                 try:
-                    bands_requested = {band: assets[band.lower()] for band in bands_requested}
+                    bands_requested = {
+                        band: assets[band.lower()] for band in bands_requested
+                    }
                 except KeyError:
-                    raise KeyError(f"Common names of the STAC assets ({assets.keys()}) do not match provided bands_requested keys ({bands_requested}).")
+                    raise KeyError(
+                        f"Common names of the STAC assets ({assets.keys()}) do not match provided bands_requested keys ({bands_requested})."
+                    )
 
                 rio_gdal_options = {
                     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
@@ -291,16 +302,23 @@ class GeoInference:
                 }
                 all_bands_requested = []
                 with rasterio.Env(**rio_gdal_options):
-                    with rasterio.open(bands_requested[next(iter(bands_requested))]["meta"].href, "r") as src:
+                    with rasterio.open(
+                        bands_requested[next(iter(bands_requested))]["meta"].href, "r"
+                    ) as src:
                         self.raster_meta = src.meta
                         self.raster = src
                         self.no_data = src.nodata
                         self.input_dtype = src.dtypes[0]
                     for key, value in bands_requested.items():
-                        all_bands_requested.append(rioxarray.open_rasterio(value["meta"].href, chunks=(1, stride_patch_size, stride_patch_size)))
+                        all_bands_requested.append(
+                            rioxarray.open_rasterio(
+                                value["meta"].href,
+                                chunks=(1, stride_patch_size, stride_patch_size),
+                            )
+                        )
                 aoi_dask_array = xr.concat(all_bands_requested, dim="band")
                 del all_bands_requested
-            
+
             is_float = False
             if self.no_data is None:
                 if np.issubdtype(np.dtype(self.input_dtype), np.floating):
@@ -314,7 +332,7 @@ class GeoInference:
                 self.valid_mask = (aoi_dask_array != self.no_data).all(dim="band")
 
             if bbox is not None:
-                if not isinstance(bbox, (List, ListConfig)):
+                if not isinstance(bbox, (List)):
                     raise TypeError("bbox should be a list.")
                 bbox = tuple(map(float, bbox))
                 self.roi_window = from_bounds(
@@ -324,22 +342,32 @@ class GeoInference:
                     top=bbox[3],
                     transform=self.raster_meta["transform"],
                 )
-                self.bbox_transform = from_origin(bbox[0], 
-                    bbox[3],  
-                    self.raster_meta["transform"].a, 
-                    self.raster_meta["transform"].e if self.raster_meta["transform"].e > 0 else -1 * self.raster_meta["transform"].e
+                self.bbox_transform = from_origin(
+                    bbox[0],
+                    bbox[3],
+                    self.raster_meta["transform"].a,
+                    self.raster_meta["transform"].e
+                    if self.raster_meta["transform"].e > 0
+                    else -1 * self.raster_meta["transform"].e,
                 )
-                col_off, row_off = int(self.roi_window.col_off), int(self.roi_window.row_off)
+                col_off, row_off = (
+                    int(self.roi_window.col_off),
+                    int(self.roi_window.row_off),
+                )
                 width, height = int(self.roi_window.width), int(self.roi_window.height)
                 aoi_dask_array = aoi_dask_array[
                     :, row_off : row_off + height, col_off : col_off + width
                 ]
-                self.valid_mask = self.valid_mask[row_off : row_off + height, col_off : col_off + width]
-                self.raster_meta.update({
-                    'transform': self.bbox_transform,
-                    'width': aoi_dask_array.shape[2],
-                    'height': aoi_dask_array.shape[1]
-                })
+                self.valid_mask = self.valid_mask[
+                    row_off : row_off + height, col_off : col_off + width
+                ]
+                self.raster_meta.update(
+                    {
+                        "transform": self.bbox_transform,
+                        "width": aoi_dask_array.shape[2],
+                        "height": aoi_dask_array.shape[1],
+                    }
+                )
             self.original_shape = aoi_dask_array.shape
             # Pad the array to make dimensions multiples of the patch size
             pad_height = (
@@ -354,14 +382,30 @@ class GeoInference:
                 mode="constant",
             ).rechunk((aoi_dask_array.shape[0], stride_patch_size, stride_patch_size))
 
+            ordered_input = []
+            if self.metadata and sensor_name:
+                if sensor_name in self.metadata:
+                    sensor_meta = self.metadata[sensor_name]
+                    ordered_input = [
+                        sensor_meta[k] for k in sorted(sensor_meta.keys(), key=int)
+                    ]
+                else:
+                    raise ValueError(f"Sensor name {sensor_name} not found in metadata")
+            if self.metadata and not sensor_name:
+                raise ValueError("Sensor name is required when model has metadata")
+                
+
             # run the model
             aoi_dask_array = aoi_dask_array.map_overlap(
                 runModel,
                 model=self.model,
+                ordered_input=ordered_input,
                 patch_size=patch_size,
                 device=self.device,
                 num_classes=self.classes,
-                no_data = self.no_data,
+                no_data=self.no_data,
+                use_geometric_tta=self.geometric_tta,
+                use_radiometric_tta=self.radiometric_tta,
                 chunks=(
                     self.classes + 1,
                     patch_size,
@@ -375,7 +419,7 @@ class GeoInference:
             aoi_dask_array = aoi_dask_array.map_overlap(
                 sum_overlapped_chunks,
                 chunk_size=patch_size,
-                prediction_threshold = self.prediction_threshold,
+                prediction_threshold=self.prediction_threshold,
                 drop_axis=0,
                 chunks=(
                     stride_patch_size,
@@ -386,16 +430,24 @@ class GeoInference:
                 boundary="none",
                 dtype=np.uint8,
             )
-            
+
             with ProgressBar() as pbar:
                 pbar.register()
                 # import rioxarray
                 logger.info("Inference is running:")
-                aoi_dask_array = xr.DataArray(aoi_dask_array[: self.original_shape[1], : self.original_shape[2]], dims=("y", "x"), attrs= self.json if self.json is not None else xarray_profile_info(self.raster_meta))
+                aoi_dask_array = xr.DataArray(
+                    aoi_dask_array[: self.original_shape[1], : self.original_shape[2]],
+                    dims=("y", "x"),
+                    attrs=self.json
+                    if self.json is not None
+                    else xarray_profile_info(self.raster_meta),
+                )
                 aoi_dask_array = aoi_dask_array.where(self.valid_mask, other=255)
                 aoi_dask_array.rio.write_nodata(255, inplace=True)
-                aoi_dask_array.rio.to_raster(mask_path, tiled=True, lock=threading.Lock())
-                
+                aoi_dask_array.rio.to_raster(
+                    mask_path, tiled=True, lock=threading.Lock()
+                )
+
             total_time = time.time() - start_time
             if self.mask_to_vec:
                 mask_to_poly_geojson(mask_path, polygons_path)
@@ -414,11 +466,12 @@ class GeoInference:
         except Exception as e:
             print(f"Processing on the Dask cluster failed due to: {e}")
             raise e
-    
-    async def constant_gc(self,interval_seconds):
+
+    async def constant_gc(self, interval_seconds):
         while True:
             gc.collect()  # Call garbage collection
             await asyncio.sleep(interval_seconds)  # Wait for the specified interval
+
 
 def main() -> None:
     arguments = cmd_interface()
@@ -433,19 +486,18 @@ def main() -> None:
         gpu_id=arguments["gpu_id"],
         num_classes=arguments["classes"],
         prediction_threshold=arguments["prediction_threshold"],
-        transformers=arguments["transformers"],
-        transformer_flip=arguments["transformer_flip"],
-        transformer_rotate=arguments["transformer_rotate"],
+        geometric_tta=arguments["geometric_tta"],
+        radiometric_tta=arguments["radiometric_tta"],
     )
     inference_mask_layer_name = geo_inference(
         inference_input=arguments["image"],
+        sensor_name=arguments["sensor_name"],
         bands_requested=arguments["bands_requested"],
         patch_size=arguments["patch_size"],
         workers=arguments["workers"],
         bbox=arguments["bbox"],
     )
     print(inference_mask_layer_name)
-    
 
 
 if __name__ == "__main__":
