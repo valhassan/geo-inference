@@ -494,9 +494,6 @@ def cmd_interface(argv=None):
     
     parser.add_argument("-pr", "--prediction_thr", type=float, nargs=1, help="Prediction Threshold")
     
-    parser.add_argument("-gtta", "--geometric_tta", nargs=1, help="Geometric TTA")
-    parser.add_argument("-rtta", "--radiometric_tta", nargs=1, help="Radiometric TTA")
-    
     args = parser.parse_args()
 
     if args.args:
@@ -516,8 +513,6 @@ def cmd_interface(argv=None):
         classes = config["arguments"]["classes"]
         patch_size = config["arguments"]["patch_size"]
         prediction_threshold = config["arguments"]["prediction_thr"]
-        geometric_tta = config["arguments"]["geometric_tta"]
-        radiometric_tta = config["arguments"]["radiometric_tta"]
         sensor_name = config["arguments"].get("sensor_name")
 
     elif args.image:
@@ -536,8 +531,6 @@ def cmd_interface(argv=None):
         classes = args.classes[0] if args.classes else 5
         patch_size = args.patch_size[0] if args.patch_size else 1024 
         prediction_threshold = args.prediction_thr[0] if args.prediction_thr else 0.3
-        geometric_tta = args.geometric_tta[0] if args.geometric_tta else False
-        radiometric_tta = args.radiometric_tta[0] if args.radiometric_tta else False
         sensor_name = args.sensor_name[0] if args.sensor_name else None
 
     else:
@@ -559,8 +552,6 @@ def cmd_interface(argv=None):
         "gpu_id": gpu_id,
         "patch_size": patch_size,
         "prediction_threshold": prediction_threshold,
-        "geometric_tta": geometric_tta,
-        "radiometric_tta": radiometric_tta,
         "sensor_name": sensor_name,
     }
     return arguments
