@@ -44,9 +44,9 @@ def runModel(
 
     try:
         step = patch_size >> 1
-        window = w.hann(M=patch_size, sym=False)
+        window = w.hann(M=patch_size, sym=False).astype(np.float32, copy=False)
         window = window[:, np.newaxis] * window[np.newaxis, :]
-        final_window = np.empty((1, 1))
+        final_window = window
 
         if chunk_location[2] >= num_chunks[2] - 2 and chunk_location[1] == 0:
             window_u = np.vstack(
@@ -63,7 +63,7 @@ def runModel(
             )
             final_window = np.block(
                 [
-                    [window_u[:step, :step], np.ones((step, step))],
+                    [window_u[:step, :step], np.ones((step, step), dtype=np.float32)],
                     [window_r[step:, :step], window_r[step:, step:]],
                 ]
             )
@@ -96,7 +96,7 @@ def runModel(
             final_window = np.block(
                 [
                     [window_r[:step, :step], window_r[:step, step:]],
-                    [window_b[step:, :step], np.ones((step, step))],
+                    [window_b[step:, :step], np.ones((step, step), dtype=np.float32)],
                 ]
             )
         elif chunk_location[1] >= num_chunks[1] - 2 and (
@@ -126,7 +126,7 @@ def runModel(
             final_window = np.block(
                 [
                     [window_l[:step, :step], window_l[:step, step:]],
-                    [np.ones((step, step)), window_b[step:, step:]],
+                    [np.ones((step, step), dtype=np.float32), window_b[step:, step:]],
                 ]
             )
         elif chunk_location[1] == 0 and chunk_location[2] == 0:
@@ -145,7 +145,7 @@ def runModel(
             )
             final_window = np.block(
                 [
-                    [np.ones((step, step)), window_u[:step, step:]],
+                    [np.ones((step, step), dtype=np.float32), window_u[:step, step:]],
                     [window_l[step:, :step], window_l[step:, step:]],
                 ]
             )
@@ -201,9 +201,15 @@ def runModel(
             patch_size,
             patch_size,
         ):
-            return np.concatenate(
-                (out * final_window, final_window[np.newaxis, :, :]), axis=0
-            )
+            if out.shape[0] != num_classes:
+                return np.zeros(
+                    (num_classes + 1, patch_size, patch_size), dtype=np.float16
+                )
+
+            result = np.empty((num_classes + 1, patch_size, patch_size), dtype=np.float16)
+            result[:-1, :, :] = (out * final_window).astype(np.float16, copy=False)
+            result[-1, :, :] = final_window.astype(np.float16, copy=False)
+            return result
         return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
 
     except Exception as e:
@@ -233,7 +239,7 @@ def sum_overlapped_chunks(
     if aoi_chunk.size > 0 and aoi_chunk is not None:
         num_chunks = block_info[0]["num-chunks"]
         chunk_location = block_info[0]["chunk-location"]
-        full_array = np.empty((1, 1))
+        full_array = None
         if (chunk_location[1] == 0 or chunk_location[1] == num_chunks[1] - 1) and (
             chunk_location[2] == 0 or chunk_location[2] == num_chunks[2] - 1
         ):
@@ -302,6 +308,9 @@ def sum_overlapped_chunks(
                 ]
             )
 
+        if full_array is None:
+            return np.zeros((int(chunk_size / 2), int(chunk_size / 2)), dtype=np.uint8)
+
         if full_array.shape != (
             aoi_chunk.shape[0],
             int(chunk_size / 2),
@@ -311,22 +320,22 @@ def sum_overlapped_chunks(
                 f" In sum_overlapped_chunks the shape of full_array is not {(6, int(chunk_size / 2), int(chunk_size / 2))}"
                 f" The size of it {full_array.shape}"
             )
+            return np.zeros((int(chunk_size / 2), int(chunk_size / 2)), dtype=np.uint8)
         else:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                final_result = np.divide(
-                    full_array[:-1, :, :],
-                    full_array[-1, :, :][np.newaxis, :, :],
-                    out=np.zeros_like(full_array[:-1, :, :], dtype=float),
-                    where=full_array[-1, :, :] != 0,
+            final_result = np.divide(
+                full_array[:-1, :, :],
+                full_array[-1, :, :][np.newaxis, :, :],
+                out=np.zeros_like(full_array[:-1, :, :], dtype=float),
+                where=full_array[-1, :, :] != 0,
+            )
+            if final_result.shape[0] == 1:
+                final_result = (
+                    np.where(final_result > prediction_threshold, 1, 0)
+                    .squeeze(0)
+                    .astype(np.uint8)
                 )
-                if final_result.shape[0] == 1:
-                    final_result = (
-                        np.where(final_result > prediction_threshold, 1, 0)
-                        .squeeze(0)
-                        .astype(np.uint8)
-                    )
-                else:
-                    final_result = np.argmax(final_result, axis=0).astype(np.uint8)
+            else:
+                final_result = np.argmax(final_result, axis=0).astype(np.uint8)
             return final_result
 
 
