@@ -38,7 +38,8 @@ from .utils.helpers import (
     xarray_profile_info,
 )
 from .utils.polygon import gdf_to_yolo, geojson2coco, mask_to_poly_geojson
-from config import logging_config # noqa: F401
+from .config import logging_config  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,8 +58,6 @@ class GeoInference:
         gpu_id (int): The ID of the GPU to use for inference (if device is "gpu").
         num_classes (int) : The number of classes in the output of the model.
         prediction_threshold (float): Prediction probability Threshold (fraction of 1) to use.
-        geometric_tta (bool): Whether to perform geometric test-time augmentations.
-        radiometric_tta (bool): Whether to perform radiometric test-time augmentations.
 
     Attributes:
         work_dir (Path): The directory where the model and output files will be saved.
@@ -84,33 +83,25 @@ class GeoInference:
         gpu_id: int = 0,
         num_classes: int = 5,
         prediction_threshold: float = 0.3,
-        geometric_tta: bool = False,
-        radiometric_tta: bool = False,
     ):
         self.work_dir: Path = get_directory(work_dir)
         self.device = select_model_device(gpu_id, multi_gpu, device)
-
+        self._model_path = str(
+            get_model(model_path_or_url=model, work_dir=self.work_dir)
+        )
         extra_files = {"metadata.json": ""}
         self.model = (
-            torch.export.load(
-                get_model(
-                    model_path_or_url=model,
-                    work_dir=self.work_dir,
-                ),
-                extra_files=extra_files,
-            )
+            torch.export.load(self._model_path, extra_files=extra_files)
             .module()
             .to(self.device)
         )
-        metadata = extra_files.get("metadata.json", "").strip()
-        self.metadata = json.loads(metadata) if metadata else None
+        raw = extra_files.get("metadata.json", "").strip()
+        self.metadata = json.loads(raw) if raw else None
         self.mask_to_vec = mask_to_vec
         self.mask_to_coco = mask_to_coco
         self.mask_to_yolo = mask_to_yolo
         self.classes = num_classes
         self.prediction_threshold = prediction_threshold
-        self.geometric_tta = geometric_tta
-        self.radiometric_tta = radiometric_tta
         self.raster_meta = None
 
     @torch.no_grad()
@@ -120,7 +111,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 0,
+        workers: int = 1,
         bbox: str = None,
     ) -> str:
 
@@ -155,7 +146,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 0,
+        workers: int = 1,
         bbox: str = None,
     ) -> None:
         """
@@ -181,6 +172,8 @@ class GeoInference:
             num_workers = len(os.sched_getaffinity(0)) - 1
         else:
             num_workers = os.cpu_count() - 1
+        if "cuda" in str(self.device).lower():
+            num_workers = min(num_workers, 1)
         print(f"running dask with {num_workers} workers")
         config.set(scheduler="threads", num_workers=num_workers)
         config.set(pool=ThreadPool(num_workers))
@@ -247,20 +240,13 @@ class GeoInference:
                     meta_data_json = re.sub(r"\.zarr$", "", inference_input)
                     self.json = read_zarr_metadata(f"{meta_data_json}.json")
                 else:
-                    aoi_dask_array = rioxarray.open_rasterio(
-                        inference_input,
-                        chunks=(1, stride_patch_size, stride_patch_size),
-                    )
-                    self.raster_meta = {
-                        "driver": "GTiff",
-                        "crs": aoi_dask_array.rio.crs,
-                        "transform": aoi_dask_array.rio.transform(),
-                        "width": int(aoi_dask_array.rio.width),
-                        "height": int(aoi_dask_array.rio.height),
-                        "dtype": aoi_dask_array.dtype,
-                    }
-                    self.no_data = aoi_dask_array.rio.nodata
-                    self.input_dtype = aoi_dask_array.dtype
+                    with rasterio.open(inference_input, "r") as src:
+                        self.raster_meta = src.meta
+                        self.raster = src
+                        self.no_data = src.nodata
+                        self.input_dtype = src.dtypes[0]
+                    
+                    aoi_dask_array = rioxarray.open_rasterio(inference_input, chunks=(1, stride_patch_size, stride_patch_size))
 
                 try:
                     if bands_requested:
@@ -376,11 +362,21 @@ class GeoInference:
             pad_width = (
                 stride_patch_size - aoi_dask_array.shape[2] % stride_patch_size
             ) % stride_patch_size
-            aoi_dask_array = da.pad(
+            padded = da.pad(
                 aoi_dask_array.data if self.json is None else aoi_dask_array,
                 ((0, 0), (0, pad_height), (0, pad_width)),
                 mode="constant",
-            ).rechunk((aoi_dask_array.shape[0], stride_patch_size, stride_patch_size))
+            )
+            # Extra right/bottom margin so boundary chunks get full overlap (512×512)
+            padded = da.pad(
+                padded,
+                ((0, 0), (0, stride_patch_size), (0, stride_patch_size)),
+                mode="constant",
+                constant_values=0,
+            )
+            aoi_dask_array = padded.rechunk(
+                (aoi_dask_array.shape[0], stride_patch_size, stride_patch_size)
+            )
 
             ordered_input = []
             if self.metadata and sensor_name:
@@ -393,19 +389,20 @@ class GeoInference:
                     raise ValueError(f"Sensor name {sensor_name} not found in metadata")
             if self.metadata and not sensor_name:
                 raise ValueError("Sensor name is required when model has metadata")
-                
 
-            # run the model
+            device_str = (
+                str(self.device)
+                if isinstance(self.device, torch.device)
+                else self.device
+            )
             aoi_dask_array = aoi_dask_array.map_overlap(
                 runModel,
                 model=self.model,
                 ordered_input=ordered_input,
                 patch_size=patch_size,
-                device=self.device,
+                device=device_str,
                 num_classes=self.classes,
                 no_data=self.no_data,
-                use_geometric_tta=self.geometric_tta,
-                use_radiometric_tta=self.radiometric_tta,
                 chunks=(
                     self.classes + 1,
                     patch_size,
@@ -486,8 +483,6 @@ def main() -> None:
         gpu_id=arguments["gpu_id"],
         num_classes=arguments["classes"],
         prediction_threshold=arguments["prediction_threshold"],
-        geometric_tta=arguments["geometric_tta"],
-        radiometric_tta=arguments["radiometric_tta"],
     )
     inference_mask_layer_name = geo_inference(
         inference_input=arguments["image"],
