@@ -8,8 +8,6 @@ import scipy.signal.windows as w
 import torch
 from rasterio.transform import Affine
 
-from .utils.tta import geometric_tta, radiometric_tta
-
 logger = logging.getLogger(__name__)
 
 
@@ -21,31 +19,13 @@ def runModel(
     device: str,
     no_data: Optional[float],
     num_classes: int = 5,
-    use_geometric_tta: bool = False,
-    use_radiometric_tta: bool = False,
-    max_tta_batch: int = 4,
     block_info=None,
 ):
-    """
-    This function is for running the model on partial neighbor (The right and bottom neighbors).
-    After running the model, depending on the location of chuck, it multiplies the chunk with a window and adds the windows to another dimension of the chunk and returns it.
-    This window is used for edge artifact.
-    @param chunk_data: np.ndarray, this is a chunk of data in dask array
-            chunk_size: int, the size of chunk data that we want to feed the model with
-            model: ExportModule, the exported model.
-            ordered_input: list, the ordered input for the model.
-            patch_size: int , the size of each patch on which the model should be run.
-            device : str, the torch device; either cpu or gpu.
-            no_data: Optional[float], the no data value.
-            num_classes: int, the number of classes that model work with.
-            block_info: none, this is having all the info about the chunk relative to the whole data (dask array)
-    @return: predited chunks
-    """
     num_chunks = block_info[0]["num-chunks"]
     chunk_location = block_info[0]["chunk-location"]
 
     if chunk_data is None or chunk_data.size == 0:
-        return np.zeros((num_classes + 1, patch_size, patch_size))
+        return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
 
     if (
         (no_data is None and not np.isfinite(chunk_data).any())
@@ -60,10 +40,9 @@ def runModel(
             and np.all(chunk_data == no_data)
         )
     ):
-        return np.zeros((num_classes + 1, patch_size, patch_size))
+        return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
 
     try:
-        # Defining the base window for window creation later
         step = patch_size >> 1
         window = w.hann(M=patch_size, sym=False)
         window = window[:, np.newaxis] * window[np.newaxis, :]
@@ -195,65 +174,28 @@ def runModel(
         ):
             final_window = window
 
-        tensor = torch.as_tensor(chunk_data, device=torch.device(device))
+        tensor = torch.as_tensor(
+            chunk_data, device=torch.device(device), dtype=torch.float32
+        )
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(0)
 
         if ordered_input:
             extra_inputs = [
-                torch.as_tensor(extra_input, device=torch.device(device))
+                torch.as_tensor(
+                    extra_input, dtype=torch.float32, device=torch.device(device)
+                )
                 for extra_input in ordered_input
             ]
         else:
             extra_inputs = []
 
-        # Each branch can have geometric TTA (flips/rotations) or identity only.
-        tta_pairs: list = []
-        # Raw branch
-        if use_geometric_tta:
-            tta_pairs.extend(geometric_tta(tensor))
-        else:
-            tta_pairs.append((tensor, lambda y: y))
-        # CLAHE branch (only if radiometric TTA enabled)
-        if use_radiometric_tta:
-            tensor_clahe = radiometric_tta(tensor)
-            if use_geometric_tta:
-                tta_pairs.extend(geometric_tta(tensor_clahe))
+        with torch.no_grad():
+            if extra_inputs:
+                y = model(tensor, *extra_inputs)
             else:
-                tta_pairs.append((tensor_clahe, lambda y: y))
-
-        acc: Optional[torch.Tensor] = None
-        count = 0
-
-        for i in range(0, len(tta_pairs), max_tta_batch):
-            batch_pairs = tta_pairs[i : i + max_tta_batch]
-            batch_x = torch.cat([p[0] for p in batch_pairs], dim=0)
-
-            with torch.no_grad():
-                if extra_inputs:
-                    y = model(batch_x, *extra_inputs)
-                else:
-                    y = model(batch_x)
-
-            outs = []
-            for j, (_, inv) in enumerate(batch_pairs):
-                y_j = inv(y[j : j + 1])
-                outs.append(y_j)
-
-            y_inv = torch.cat(outs, dim=0).float()
-
-            if acc is None:
-                acc = y_inv.sum(dim=0, keepdim=True)
-            else:
-                acc = acc + y_inv.sum(dim=0, keepdim=True)
-
-            count += len(batch_pairs)
-
-        if acc is None or count == 0:
-            return np.zeros((num_classes + 1, patch_size, patch_size))
-
-        mean_pred = (acc / float(count))[0]
-        out = mean_pred.detach().cpu().numpy()
+                y = model(tensor)
+        out = y[0].float().detach().cpu().numpy()
 
         if out.shape[1:] == final_window.shape and out.shape[1:] == (
             patch_size,
@@ -262,11 +204,11 @@ def runModel(
             return np.concatenate(
                 (out * final_window, final_window[np.newaxis, :, :]), axis=0
             )
-        else:
-            return np.zeros((num_classes + 1, patch_size, patch_size))
+        return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
 
     except Exception as e:
         logging.error(f"Error occured in RunModel: {e}")
+        return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # Release unused memory
@@ -284,6 +226,7 @@ def sum_overlapped_chunks(
     @param aoi_chunk: np.ndarray, this is a chunk of data in dask array.
             aoi_chunk: int, the size of chunk data that we want to feed the model with
             chunk_size: int , the size of each patch on which the model should be run.
+            prediction_threshold: float, threshold for binary segmentation.
             block_info: none, this is having all the info about the chunk relative to the whole data (dask array)
     @return: reday-to-save chunks
     """
@@ -384,7 +327,7 @@ def sum_overlapped_chunks(
                     )
                 else:
                     final_result = np.argmax(final_result, axis=0).astype(np.uint8)
-                return final_result
+            return final_result
 
 
 def read_zarr_metadata(metadata_json: Union[Path, str]):
