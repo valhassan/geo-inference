@@ -10,6 +10,24 @@ from rasterio.transform import Affine
 
 logger = logging.getLogger(__name__)
 
+ENTROPY_WEIGHT_FLOOR: float = 1e-2
+
+
+def erode_building_logits(
+    logits: torch.Tensor,
+    class_index: int,
+) -> None:
+    """Erode building logits (min-filter) for building class."""
+    kernel_size = 5
+    ch = logits[class_index].unsqueeze(0).unsqueeze(0)
+    eroded = -torch.nn.functional.max_pool2d(
+        -ch,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    )
+    logits[class_index] = eroded.squeeze(0).squeeze(0)
+
 
 def runModel(
     chunk_data: np.ndarray,
@@ -19,6 +37,7 @@ def runModel(
     device: str,
     no_data: Optional[float],
     num_classes: int = 5,
+    building_class_index: int | None = None,
     block_info=None,
 ):
     num_chunks = block_info[0]["num-chunks"]
@@ -195,20 +214,53 @@ def runModel(
                 y = model(tensor, *extra_inputs)
             else:
                 y = model(tensor)
-        out = y[0].float().detach().cpu().numpy()
 
-        if out.shape[1:] == final_window.shape and out.shape[1:] == (
+        logits_t = y[0].float()
+
+        # TOPOLOGICAL LOGIT PENALTY (MIN FILTER) FOR BUILDING CLASS
+        if building_class_index is not None:
+            erode_building_logits(logits_t, building_class_index)
+
+        # ENTROPY WEIGHTING
+        log_probs = torch.log_softmax(logits_t, dim=0)
+        probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=0)  # (H, W)
+
+        if num_classes > 1:
+            normalized_entropy = entropy / float(np.log(num_classes))
+        else:
+            normalized_entropy = torch.zeros_like(entropy)
+
+        normalized_entropy = torch.clamp(normalized_entropy, 0.0, 1.0)
+        blend_factor = (1.0 - normalized_entropy) + ENTROPY_WEIGHT_FLOOR
+
+        final_window_t = torch.as_tensor(
+            final_window,
+            device=blend_factor.device,
+            dtype=torch.float32,
+        )
+
+        if logits_t.shape[1:] == final_window_t.shape and logits_t.shape[1:] == (
             patch_size,
             patch_size,
         ):
-            if out.shape[0] != num_classes:
+            if logits_t.shape[0] != num_classes:
                 return np.zeros(
                     (num_classes + 1, patch_size, patch_size), dtype=np.float16
                 )
 
-            result = np.empty((num_classes + 1, patch_size, patch_size), dtype=np.float16)
-            result[:-1, :, :] = (out * final_window).astype(np.float16, copy=False)
-            result[-1, :, :] = final_window.astype(np.float16, copy=False)
+            dynamic_weights_t = final_window_t * blend_factor  # (H, W)
+            weighted_logits_t = logits_t * dynamic_weights_t.unsqueeze(0)  # (C, H, W)
+
+            result = np.empty(
+                (num_classes + 1, patch_size, patch_size), dtype=np.float16
+            )
+            result[:-1, :, :] = (
+                weighted_logits_t.detach().cpu().numpy().astype(np.float16, copy=False)
+            )
+            result[-1, :, :] = (
+                dynamic_weights_t.detach().cpu().numpy().astype(np.float16, copy=False)
+            )
             return result
         return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
 
@@ -224,6 +276,7 @@ def sum_overlapped_chunks(
     aoi_chunk: np.ndarray,
     chunk_size: int,
     prediction_threshold: float = 0.3,
+    class_priors: Optional[list[float]] = None,
     block_info=None,
 ):
     """
@@ -335,6 +388,12 @@ def sum_overlapped_chunks(
                     .astype(np.uint8)
                 )
             else:
+                if class_priors is not None:
+                    priors = np.asarray(class_priors, dtype=np.float32)
+                    if priors.shape == (final_result.shape[0],):
+                        priors = np.clip(priors, 1e-12, np.inf)
+                        bias = np.log(priors).astype(final_result.dtype, copy=False)
+                        final_result = final_result + bias[:, np.newaxis, np.newaxis]
                 final_result = np.argmax(final_result, axis=0).astype(np.uint8)
             return final_result
 
