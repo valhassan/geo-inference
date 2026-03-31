@@ -10,7 +10,7 @@ import time
 import uuid
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import dask.array as da
 import numpy as np
@@ -24,6 +24,7 @@ from dask.diagnostics import ProgressBar
 from rasterio.transform import from_origin
 from rasterio.windows import from_bounds
 
+from .config import logging_config  # noqa: F401
 from .geo_dask import (
     read_zarr_metadata,
     runModel,
@@ -38,37 +39,33 @@ from .utils.helpers import (
     xarray_profile_info,
 )
 from .utils.polygon import gdf_to_yolo, geojson2coco, mask_to_poly_geojson
-from .config import logging_config  # noqa: F401
+from .utils.post_inference import Config, buildings_splitter, clean_mask
 
 logger = logging.getLogger(__name__)
 
 
 class GeoInference:
     """
-    A class for performing geo inference on geospatial imagery using a pre-trained model.
+    Perform geospatial inference on imagery using a Torch-exported model.
 
     Args:
-        model (str): The path or url to the model file
-        work_dir (str): The directory where the model and output files will be saved.
-        mask_to_vec (bool): Whether to convert the output mask to vector format.
-        mask_to_coco (bool): Whether to convert the output mask to coco format.
-        mask_to_yolo (bool): Whether to convert the output mask to yolo format.
-        device (str): The device to use for inference (either "cpu" or "gpu").
-        multi_gpu (bool): Whether to run the inference on multi-gpu or not.
-        gpu_id (int): The ID of the GPU to use for inference (if device is "gpu").
-        num_classes (int) : The number of classes in the output of the model.
-        prediction_threshold (float): Prediction probability Threshold (fraction of 1) to use.
-
-    Attributes:
-        work_dir (Path): The directory where the model and output files will be saved.
-        device (str): The device to use for inference (either "cpu" or "gpu").
-        model (str): The path or url to the model file.
-        mask_to_vec (bool): Whether to convert the output mask to vector format.
-        mask_to_coco (bool): Whether to convert the output mask to coco format.
-        mask_to_yolo (bool): Whether to convert the output mask to yolo format.
-        classes (int): The number of classes in the output of the model.
-        raster_meta : The metadata of the input raster.
-
+        model (str | None): Path or URL to a Torch-exported model artifact. If a URL is
+            provided, it is downloaded into `work_dir`.
+        work_dir (str | None): Directory for the resolved model and all outputs.
+        mask_to_vec (bool): If True, convert the output mask to polygons (GeoJSON).
+        mask_to_coco (bool): If True and `mask_to_vec` is True, also emit COCO JSON.
+        mask_to_yolo (bool): If True and `mask_to_vec` is True, also emit YOLO CSV.
+        device (str | None): Device selector forwarded to `select_model_device()`.
+        multi_gpu (bool): Whether to enable multi-GPU selection in
+            `select_model_device()`.
+        gpu_id (int): GPU index used by `select_model_device()` when applicable.
+        num_classes (int): Number of output classes.
+        prediction_threshold (float): Probability threshold used during overlap
+            reduction (`sum_overlapped_chunks`).
+        post_inference (bool): Whether to run post-inference operations (e.g. cleaning,
+            splitting) driven by model metadata and `sensor_name`.
+        sam_checkpoint_path (str | None): Path to the SAM checkpoint (post-inference).
+        sam_bpe_path (str | None): Path to the SAM BPE file (post-inference).
     """
 
     def __init__(
@@ -83,6 +80,9 @@ class GeoInference:
         gpu_id: int = 0,
         num_classes: int = 5,
         prediction_threshold: float = 0.3,
+        post_inference: bool = False,
+        sam_checkpoint_path: str = None,
+        sam_bpe_path: str = None,
     ):
         self.work_dir: Path = get_directory(work_dir)
         self.device = select_model_device(gpu_id, multi_gpu, device)
@@ -102,8 +102,10 @@ class GeoInference:
         self.mask_to_yolo = mask_to_yolo
         self.classes = num_classes
         self.prediction_threshold = prediction_threshold
+        self.post_inference = post_inference
         self.raster_meta = None
-
+        self.sam_checkpoint_path = sam_checkpoint_path
+        self.sam_bpe_path = sam_bpe_path
     @torch.no_grad()
     def __call__(
         self,
@@ -111,7 +113,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 1,
+        workers: int = 0,
         bbox: str = None,
     ) -> str:
 
@@ -146,7 +148,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 1,
+        workers: int = 0,
         bbox: str = None,
     ) -> None:
         """
@@ -172,8 +174,6 @@ class GeoInference:
             num_workers = len(os.sched_getaffinity(0)) - 1
         else:
             num_workers = os.cpu_count() - 1
-        if "cuda" in str(self.device).lower():
-            num_workers = min(num_workers, 1)
         print(f"running dask with {num_workers} workers")
         config.set(scheduler="threads", num_workers=num_workers)
         config.set(pool=ThreadPool(num_workers))
@@ -245,8 +245,11 @@ class GeoInference:
                         self.raster = src
                         self.no_data = src.nodata
                         self.input_dtype = src.dtypes[0]
-                    
-                    aoi_dask_array = rioxarray.open_rasterio(inference_input, chunks=(1, stride_patch_size, stride_patch_size))
+
+                    aoi_dask_array = rioxarray.open_rasterio(
+                        inference_input,
+                        chunks=(1, stride_patch_size, stride_patch_size),
+                    )
 
                 try:
                     if bands_requested:
@@ -378,17 +381,21 @@ class GeoInference:
                 (aoi_dask_array.shape[0], stride_patch_size, stride_patch_size)
             )
 
-            ordered_input = []
-            if self.metadata and sensor_name:
-                if sensor_name in self.metadata:
-                    sensor_meta = self.metadata[sensor_name]
-                    ordered_input = [
-                        sensor_meta[k] for k in sorted(sensor_meta.keys(), key=int)
-                    ]
-                else:
+            ordered_input: List[Any] = []
+            sensor_meta: Dict[str, Any] = {}
+            class_priors: Optional[list[float]] = None
+
+            if self.metadata:
+                if not sensor_name:
+                    raise ValueError("Sensor name is required when model has metadata")
+                if sensor_name not in self.metadata:
                     raise ValueError(f"Sensor name {sensor_name} not found in metadata")
-            if self.metadata and not sensor_name:
-                raise ValueError("Sensor name is required when model has metadata")
+
+                sensor_meta = self.metadata[sensor_name]
+                ordered_input = sensor_meta.get("model_inputs", [])
+
+                if "class_priors" in sensor_meta:
+                    class_priors = sensor_meta["class_priors"]
 
             device_str = (
                 str(self.device)
@@ -417,6 +424,7 @@ class GeoInference:
                 sum_overlapped_chunks,
                 chunk_size=patch_size,
                 prediction_threshold=self.prediction_threshold,
+                class_priors=class_priors,
                 drop_axis=0,
                 chunks=(
                     stride_patch_size,
@@ -445,13 +453,43 @@ class GeoInference:
                     mask_path, tiled=True, lock=threading.Lock()
                 )
 
-            total_time = time.time() - start_time
+            
+
+            if self.post_inference:
+                if "building" in sensor_meta["class_labels"]:
+                    building_class_index = int(sensor_meta["class_labels"]["building"])
+                    gsd = sensor_meta["gsd"]
+                    splitter_config = Config(
+                        building_class_index=building_class_index,
+                        road_class_index=3,
+                        gsd=gsd,
+                        device=device_str,
+                        checkpoint_path=self.sam_checkpoint_path,
+                        bpe_path=self.sam_bpe_path,
+                    )
+                    mask_path = buildings_splitter(
+                        inference_input, mask_path, splitter_config
+                    )
+
+                min_area_m2 = sensor_meta.get("min_area_m2")
+                if min_area_m2 is not None:
+                    road_class_index = None
+                    if "road" in sensor_meta["class_labels"]:
+                        road_class_index = int(sensor_meta["class_labels"]["road"])
+                    clean_config = Config(
+                        road_class_index=road_class_index,
+                        gsd=gsd,
+                        min_area_m2=min_area_m2,
+                    )
+                    mask_path = clean_mask(mask_path, clean_config)
+
             if self.mask_to_vec:
                 mask_to_poly_geojson(mask_path, polygons_path)
                 if self.mask_to_yolo:
                     gdf_to_yolo(polygons_path, mask_path, yolo_csv_path)
                 if self.mask_to_coco:
                     geojson2coco(mask_path, polygons_path, coco_json_path)
+            total_time = time.time() - start_time
             logger.info(
                 "Extraction Completed in {:.0f}m {:.0f}s".format(
                     total_time // 60, total_time % 60
@@ -483,6 +521,9 @@ def main() -> None:
         gpu_id=arguments["gpu_id"],
         num_classes=arguments["classes"],
         prediction_threshold=arguments["prediction_threshold"],
+        post_inference=arguments.get("post_inference", False),
+        sam_checkpoint_path=arguments.get("sam_checkpoint_path"),
+        sam_bpe_path=arguments.get("sam_bpe_path"),
     )
     inference_mask_layer_name = geo_inference(
         inference_input=arguments["image"],
