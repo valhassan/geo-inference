@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -5,9 +6,12 @@ from typing import Optional
 import numpy as np
 import rasterio
 from samgeo import SamGeo3
-from scipy.ndimage import binary_closing
+from scipy.ndimage import binary_closing, binary_erosion
 from skimage import measure, morphology
 from skimage.morphology import disk
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,16 +25,6 @@ class Config:
     checkpoint_path: Optional[str] = None
     bpe_path: Optional[str] = None
     min_area_m2: Optional[dict] = field(default_factory=dict)
-
-
-def _get_gsd(path: str | Path) -> float:
-    with rasterio.open(path) as src:
-        t = src.transform
-        px = (abs(t.a) + abs(t.e)) / 2
-        if src.crs and src.crs.is_geographic:
-            lat = (src.bounds.top + src.bounds.bottom) / 2
-            px = px * 111_320 * np.cos(np.radians(lat))
-    return float(px)
 
 
 def buildings_splitter(
@@ -58,8 +52,6 @@ def buildings_splitter(
     """
     if cfg.building_class_index is None:
         raise ValueError("building_class_index is required")
-    gsd = cfg.gsd if cfg.gsd is not None else _get_gsd(geotiff_path)
-    print(f"[pipeline] GSD={gsd:.3f} m/px")
 
     with rasterio.open(mask_path) as src:
         pred_mask = src.read(1)
@@ -67,7 +59,7 @@ def buildings_splitter(
 
     building_mask = pred_mask == cfg.building_class_index
     if not building_mask.any():
-        print("[pipeline] no buildings in mask — returning input unchanged")
+        logger.warning("no buildings in mask — returning input unchanged")
         return Path(mask_path)
 
     sam3 = SamGeo3(
@@ -79,8 +71,8 @@ def buildings_splitter(
     )
 
     mask_path = Path(mask_path)
-    out_path = mask_path.with_name(mask_path.stem + ".corrected.tif")
-    tmp_path = mask_path.with_name(mask_path.stem + ".sam3_tmp.tif")
+    out_path = mask_path.with_name(mask_path.stem + "_build_fix.tif")
+    tmp_path = mask_path.with_name(mask_path.stem + "_sam3_tmp.tif")
 
     sam3.generate_masks_tiled(
         source=str(geotiff_path),
@@ -100,23 +92,18 @@ def buildings_splitter(
     region_ids = np.unique(labeled_regions)
     region_ids = region_ids[region_ids != 0]
 
-    print(f"[pipeline] building regions: {len(region_ids)}")
+    logger.info(f"building regions: {len(region_ids)}")
 
     out = pred_mask.copy()
     n_split = 0
 
-    for region_id in region_ids:
+    for region_id in tqdm(region_ids, desc="Splitting regions"):
         region_pixels = labeled_regions == region_id
         sam3_ids_in_region = np.unique(instance_labels[region_pixels])
         sam3_ids_in_region = sam3_ids_in_region[sam3_ids_in_region != 0]
 
         if len(sam3_ids_in_region) < cfg.merge_threshold:
             continue
-
-        print(
-            f"[pipeline] splitting region {region_id} → "
-            f"{len(sam3_ids_in_region)} instances"
-        )
 
         out[region_pixels] = 0
 
@@ -126,17 +113,23 @@ def buildings_splitter(
                 out[sub_region] = cfg.building_class_index
 
         n_split += 1
+        
+    erode_radius_m = 0.5
+    shrink_px = max(1, round(erode_radius_m / cfg.gsd))
+    building_output = out == cfg.building_class_index
+    eroded_buildings = binary_erosion(building_output, iterations=shrink_px)
+    out[building_output & ~eroded_buildings] = 0
 
     # missed = building_mask & (out != cfg.building_class_index)
     # if missed.any():
     #     out[missed] = cfg.building_class_index
     #     print(f"[pipeline] fallback: restored {missed.sum()} uncovered pixels")
 
-    print(f"[pipeline] regions split: {n_split}/{len(region_ids)}")
+    logger.info(f"regions split: {n_split}/{len(region_ids)}")
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(out, 1)
-
+    logger.info(f"saved {out_path}")
     return out_path
 
 
@@ -161,11 +154,11 @@ def clean_mask(
         cfg:       Config
 
     Returns:
-        Path to the cleaned mask (``<stem>.cleaned.tif``).
+        Path to the cleaned mask (``<stem>_cleaned.tif``).
         The input mask_path is never modified.
     """
     mask_path = Path(mask_path)
-    out_path = mask_path.with_name(mask_path.stem + ".cleaned.tif")
+    out_path = mask_path.with_name(mask_path.stem + "_cleaned.tif")
 
     with rasterio.open(mask_path) as src:
         mask = src.read(1)
@@ -197,17 +190,16 @@ def clean_mask(
             binary = out == class_idx
 
         # small region removal
-        cleaned = morphology.remove_small_objects(binary, min_size=min_px)
+        cleaned = morphology.remove_small_objects(binary, max_size=min_px)
         removed = binary & ~cleaned
         if removed.any():
             out[removed] = cfg.background_index
-            print(
-                f"[clean_mask] class {class_idx}: removed {removed.sum()} px "
+            logger.debug(
+                f"class {class_idx}: removed {removed.sum()} px "
                 f"(min={min_px}px / {min_m2:.1f}m²)"
             )
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(out, 1)
-
-    print(f"[clean_mask] saved {out_path}")
+    logger.info(f"saved {out_path}")
     return out_path
