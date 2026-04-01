@@ -13,22 +13,6 @@ logger = logging.getLogger(__name__)
 ENTROPY_WEIGHT_FLOOR: float = 1e-2
 
 
-def erode_building_logits(
-    logits: torch.Tensor,
-    class_index: int,
-) -> None:
-    """Erode building logits (min-filter) for building class."""
-    kernel_size = 5
-    ch = logits[class_index].unsqueeze(0).unsqueeze(0)
-    eroded = -torch.nn.functional.max_pool2d(
-        -ch,
-        kernel_size=kernel_size,
-        stride=1,
-        padding=kernel_size // 2,
-    )
-    logits[class_index] = eroded.squeeze(0).squeeze(0)
-
-
 def runModel(
     chunk_data: np.ndarray,
     model,
@@ -37,7 +21,6 @@ def runModel(
     device: str,
     no_data: Optional[float],
     num_classes: int = 5,
-    building_class_index: int | None = None,
     block_info=None,
 ):
     num_chunks = block_info[0]["num-chunks"]
@@ -216,10 +199,6 @@ def runModel(
                 y = model(tensor)
 
         logits_t = y[0].float()
-
-        # TOPOLOGICAL LOGIT PENALTY (MIN FILTER) FOR BUILDING CLASS
-        if building_class_index is not None:
-            erode_building_logits(logits_t, building_class_index)
 
         # ENTROPY WEIGHTING
         log_probs = torch.log_softmax(logits_t, dim=0)
