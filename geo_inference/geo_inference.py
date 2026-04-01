@@ -106,6 +106,7 @@ class GeoInference:
         self.raster_meta = None
         self.sam_checkpoint_path = sam_checkpoint_path
         self.sam_bpe_path = sam_bpe_path
+
     @torch.no_grad()
     def __call__(
         self,
@@ -453,8 +454,6 @@ class GeoInference:
                     mask_path, tiled=True, lock=threading.Lock()
                 )
 
-            
-
             if self.post_inference:
                 if "building" in sensor_meta["class_labels"]:
                     building_class_index = int(sensor_meta["class_labels"]["building"])
@@ -472,6 +471,11 @@ class GeoInference:
                     )
 
                 min_area_m2 = sensor_meta.get("min_area_m2")
+                min_area_m2 = (
+                    {int(k): float(v) for k, v in min_area_m2.items()}
+                    if min_area_m2
+                    else None
+                )
                 if min_area_m2 is not None:
                     road_class_index = None
                     if "road" in sensor_meta["class_labels"]:
