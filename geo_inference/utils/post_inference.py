@@ -9,7 +9,6 @@ from samgeo import SamGeo3
 from scipy.ndimage import binary_closing, binary_erosion
 from skimage import measure, morphology
 from skimage.morphology import disk
-from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +46,7 @@ def buildings_splitter(
         cfg:          Config
 
     Returns:
-        Path to the corrected mask file (``<stem>.corrected.tif``).
+        Path to the corrected mask file (``<stem>_build_fix.tif``).
         The original ``mask_path`` is never modified.
     """
     if cfg.building_class_index is None:
@@ -95,37 +94,42 @@ def buildings_splitter(
     logger.info(f"building regions: {len(region_ids)}")
 
     out = pred_mask.copy()
-    n_split = 0
 
-    for region_id in tqdm(region_ids, desc="Splitting regions"):
-        region_pixels = labeled_regions == region_id
-        sam3_ids_in_region = np.unique(instance_labels[region_pixels])
-        sam3_ids_in_region = sam3_ids_in_region[sam3_ids_in_region != 0]
+    flat_region = labeled_regions.ravel()
+    flat_sam3 = instance_labels.ravel()
+    valid = (flat_region != 0) & (flat_sam3 != 0)
+    valid_indices = np.where(valid)[0]
 
-        if len(sam3_ids_in_region) < cfg.merge_threshold:
-            continue
+    order = np.lexsort((flat_sam3[valid], flat_region[valid]))
+    sorted_idx = valid_indices[order]
+    sorted_r = flat_region[valid][order]
+    sorted_s = flat_sam3[valid][order]
 
-        out[region_pixels] = 0
+    boundaries = np.where(np.diff(sorted_r) | np.diff(sorted_s))[0] + 1
+    group_starts = np.concatenate([[0], boundaries])
+    group_ends = np.concatenate([boundaries, [len(sorted_idx)]])
+    group_r = sorted_r[group_starts]
 
-        for sam3_id in sam3_ids_in_region:
-            sub_region = region_pixels & (instance_labels == sam3_id)
-            if sub_region.any():
-                out[sub_region] = cfg.building_class_index
+    unique_regions, sam3_counts = np.unique(group_r, return_counts=True)
+    regions_to_split = set(unique_regions[sam3_counts >= cfg.merge_threshold].tolist())
 
-        n_split += 1
-        
+    split_region_mask = np.isin(labeled_regions, list(regions_to_split))
+    out[split_region_mask] = 0
+
+    out_flat = out.ravel()
+    split_mask = np.isin(group_r, list(regions_to_split))
+
+    for start, end in zip(group_starts[split_mask], group_ends[split_mask]):
+        out_flat[sorted_idx[start:end]] = cfg.building_class_index
+
+    n_split = len(regions_to_split)
+    logger.info(f"regions split: {n_split}/{len(region_ids)}")
+
     erode_radius_m = 0.5
     shrink_px = max(1, round(erode_radius_m / cfg.gsd))
     building_output = out == cfg.building_class_index
     eroded_buildings = binary_erosion(building_output, iterations=shrink_px)
     out[building_output & ~eroded_buildings] = 0
-
-    # missed = building_mask & (out != cfg.building_class_index)
-    # if missed.any():
-    #     out[missed] = cfg.building_class_index
-    #     print(f"[pipeline] fallback: restored {missed.sum()} uncovered pixels")
-
-    logger.info(f"regions split: {n_split}/{len(region_ids)}")
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(out, 1)
