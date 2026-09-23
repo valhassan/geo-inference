@@ -64,8 +64,6 @@ class GeoInference:
             reduction (`sum_overlapped_chunks`).
         post_inference (bool): Whether to run post-inference operations (e.g. cleaning,
             splitting) driven by model metadata and `sensor_name`.
-        sam_checkpoint_path (str | None): Path to the SAM checkpoint (post-inference).
-        sam_bpe_path (str | None): Path to the SAM BPE file (post-inference).
     """
 
     def __init__(
@@ -81,8 +79,6 @@ class GeoInference:
         num_classes: int = 5,
         prediction_threshold: float = 0.3,
         post_inference: bool = False,
-        sam_checkpoint_path: str = None,
-        sam_bpe_path: str = None,
     ):
         self.work_dir: Path = get_directory(work_dir)
         self.device = select_model_device(gpu_id, multi_gpu, device)
@@ -104,8 +100,6 @@ class GeoInference:
         self.prediction_threshold = prediction_threshold
         self.post_inference = post_inference
         self.raster_meta = None
-        self.sam_checkpoint_path = sam_checkpoint_path
-        self.sam_bpe_path = sam_bpe_path
 
     @torch.no_grad()
     def __call__(
@@ -493,8 +487,6 @@ def main() -> None:
         num_classes=arguments["classes"],
         prediction_threshold=arguments["prediction_threshold"],
         post_inference=arguments.get("post_inference", False),
-        sam_checkpoint_path=arguments.get("sam_checkpoint_path"),
-        sam_bpe_path=arguments.get("sam_bpe_path"),
     )
     inference_mask_layer_name = geo_inference(
         inference_input=arguments["image"],
