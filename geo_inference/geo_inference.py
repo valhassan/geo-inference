@@ -10,7 +10,7 @@ import time
 import uuid
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import dask.array as da
 import numpy as np
@@ -39,7 +39,7 @@ from .utils.helpers import (
     xarray_profile_info,
 )
 from .utils.polygon import gdf_to_yolo, geojson2coco, mask_to_poly_geojson
-from .utils.post_inference import Config, buildings_splitter, clean_mask
+from .utils.post_inference import Config, clean_mask
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +384,6 @@ class GeoInference:
 
             ordered_input: List[Any] = []
             sensor_meta: Dict[str, Any] = {}
-            class_priors: Optional[list[float]] = None
 
             if self.metadata:
                 if not sensor_name:
@@ -394,9 +393,6 @@ class GeoInference:
 
                 sensor_meta = self.metadata[sensor_name]
                 ordered_input = sensor_meta.get("model_inputs", [])
-
-                if "class_priors" in sensor_meta:
-                    class_priors = sensor_meta["class_priors"]
 
             device_str = (
                 str(self.device)
@@ -425,7 +421,6 @@ class GeoInference:
                 sum_overlapped_chunks,
                 chunk_size=patch_size,
                 prediction_threshold=self.prediction_threshold,
-                class_priors=class_priors,
                 drop_axis=0,
                 chunks=(
                     stride_patch_size,
@@ -455,36 +450,8 @@ class GeoInference:
                 )
 
             if self.post_inference:
-                if "building" in sensor_meta["class_labels"]:
-                    building_class_index = int(sensor_meta["class_labels"]["building"])
-                    gsd = sensor_meta["gsd"]
-                    splitter_config = Config(
-                        building_class_index=building_class_index,
-                        road_class_index=3,
-                        gsd=gsd,
-                        device=device_str,
-                        checkpoint_path=self.sam_checkpoint_path,
-                        bpe_path=self.sam_bpe_path,
-                    )
-                    mask_path = buildings_splitter(
-                        inference_input, mask_path, splitter_config
-                    )
-
-                min_area_m2 = sensor_meta.get("min_area_m2")
-                min_area_m2 = (
-                    {int(k): float(v) for k, v in min_area_m2.items()}
-                    if min_area_m2
-                    else None
-                )
-                if min_area_m2 is not None:
-                    road_class_index = None
-                    if "road" in sensor_meta["class_labels"]:
-                        road_class_index = int(sensor_meta["class_labels"]["road"])
-                    clean_config = Config(
-                        road_class_index=road_class_index,
-                        gsd=gsd,
-                        min_area_m2=min_area_m2,
-                    )
+                clean_config = Config.from_sensor(sensor_meta)
+                if clean_config is not None:
                     mask_path = clean_mask(mask_path, clean_config)
 
             if self.mask_to_vec:
