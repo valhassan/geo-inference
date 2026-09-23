@@ -498,10 +498,6 @@ def cmd_interface(argv=None):
         help=("Perform post-inference operations."),
     )
 
-    parser.add_argument(
-        "--sam_checkpoint_path", nargs=1, help="Path to the SAM checkpoint file"
-    )
-    parser.add_argument("--sam_bpe_path", nargs=1, help="Path to the SAM BPE file")
     args = parser.parse_args()
 
     if args.args:
@@ -526,8 +522,6 @@ def cmd_interface(argv=None):
         patch_size = config["arguments"]["patch_size"]
         prediction_threshold = config["arguments"]["prediction_thr"]
         post_inference = bool(config["arguments"].get("post_inference", False))
-        sam_checkpoint_path = config["arguments"].get("sam_checkpoint_path")
-        sam_bpe_path = config["arguments"].get("sam_bpe_path")
     elif args.image:
         image = args.image[0]
         model = args.model[0] if args.model else None
@@ -545,10 +539,6 @@ def cmd_interface(argv=None):
         patch_size = args.patch_size[0] if args.patch_size else 1024
         prediction_threshold = args.prediction_thr[0] if args.prediction_thr else 0.3
         post_inference = bool(args.post_inference)
-        sam_checkpoint_path = (
-            args.sam_checkpoint_path[0] if args.sam_checkpoint_path else None
-        )
-        sam_bpe_path = args.sam_bpe_path[0] if args.sam_bpe_path else None
     else:
         print("use the help [-h] option for correct usage")
         raise SystemExit
@@ -569,8 +559,6 @@ def cmd_interface(argv=None):
         "patch_size": patch_size,
         "prediction_threshold": prediction_threshold,
         "post_inference": post_inference,
-        "sam_checkpoint_path": sam_checkpoint_path,
-        "sam_bpe_path": sam_bpe_path,
     }
     return arguments
 
