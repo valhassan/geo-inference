@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Optional, Union
 
@@ -11,6 +12,7 @@ from rasterio.transform import Affine
 logger = logging.getLogger(__name__)
 
 ENTROPY_WEIGHT_FLOOR: float = 1e-2
+_MODEL_LOCK = threading.Lock()
 
 
 def runModel(
@@ -192,7 +194,7 @@ def runModel(
         else:
             extra_inputs = []
 
-        with torch.no_grad():
+        with torch.no_grad(), _MODEL_LOCK:
             if extra_inputs:
                 y = model(tensor, *extra_inputs)
             else:
@@ -246,16 +248,12 @@ def runModel(
     except Exception as e:
         logging.error(f"Error occured in RunModel: {e}")
         return np.zeros((num_classes + 1, patch_size, patch_size), dtype=np.float16)
-    finally:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Release unused memory
 
 
 def sum_overlapped_chunks(
     aoi_chunk: np.ndarray,
     chunk_size: int,
     prediction_threshold: float = 0.3,
-    class_priors: Optional[list[float]] = None,
     block_info=None,
 ):
     """
@@ -367,12 +365,6 @@ def sum_overlapped_chunks(
                     .astype(np.uint8)
                 )
             else:
-                if class_priors is not None:
-                    priors = np.asarray(class_priors, dtype=np.float32)
-                    if priors.shape == (final_result.shape[0],):
-                        priors = np.clip(priors, 1e-12, np.inf)
-                        bias = np.log(priors).astype(final_result.dtype, copy=False)
-                        final_result = final_result + bias[:, np.newaxis, np.newaxis]
                 final_result = np.argmax(final_result, axis=0).astype(np.uint8)
             return final_result
 
