@@ -19,122 +19,23 @@ class Config:
     road_class_index: Optional[int] = None
     background_index: int = 0
     gsd: Optional[float] = None
-    device: Optional[str] = None
-    merge_threshold: int = 2
-    checkpoint_path: Optional[str] = None
-    bpe_path: Optional[str] = None
     min_area_m2: Optional[dict] = field(default_factory=dict)
 
-
-def buildings_splitter(
-    geotiff_path: str | Path,
-    mask_path: str | Path,
-    cfg: Config,
-) -> Path:
-    """
-    Splits merged buildings in a multiclass segmentation mask.
-
-    The original segmentation is the north star — building pixels are never
-    redrawn. SAM3 detects how many buildings are inside each blob and where
-    the split line is. The split is applied by intersecting SAM3 instances
-    with the original blob pixels so boundaries always come from the
-    original mask.
-
-    Args:
-        geotiff_path: path to the source GeoTIFF
-        mask_path:    path to the multiclass mask file
-        cfg:          Config
-
-    Returns:
-        Path to the corrected mask file (``<stem>_build_fix.tif``).
-        The original ``mask_path`` is never modified.
-    """
-    if cfg.building_class_index is None:
-        raise ValueError("building_class_index is required")
-
-    with rasterio.open(mask_path) as src:
-        pred_mask = src.read(1)
-        profile = src.profile.copy()
-
-    building_mask = pred_mask == cfg.building_class_index
-    if not building_mask.any():
-        logger.warning("no buildings in mask — returning input unchanged")
-        return Path(mask_path)
-
-    sam3 = SamGeo3(
-        backend="meta",
-        bpe_path=cfg.bpe_path,
-        checkpoint_path=cfg.checkpoint_path,
-        load_from_HF=cfg.checkpoint_path is None,
-        device=cfg.device,
-    )
-
-    mask_path = Path(mask_path)
-    out_path = mask_path.with_name(mask_path.stem + "_build_fix.tif")
-    tmp_path = mask_path.with_name(mask_path.stem + "_sam3_tmp.tif")
-
-    sam3.generate_masks_tiled(
-        source=str(geotiff_path),
-        prompt="building",
-        output=str(tmp_path),
-        bands=[1, 2, 3],
-        unique=True,
-        dtype="uint32",
-    )
-
-    with rasterio.open(tmp_path) as src:
-        instance_labels = src.read(1)
-
-    tmp_path.unlink(missing_ok=True)
-
-    labeled_regions = measure.label(building_mask)
-    region_ids = np.unique(labeled_regions)
-    region_ids = region_ids[region_ids != 0]
-
-    logger.info(f"building regions: {len(region_ids)}")
-
-    out = pred_mask.copy()
-
-    flat_region = labeled_regions.ravel()
-    flat_sam3 = instance_labels.ravel()
-    valid = (flat_region != 0) & (flat_sam3 != 0)
-    valid_indices = np.where(valid)[0]
-
-    order = np.lexsort((flat_sam3[valid], flat_region[valid]))
-    sorted_idx = valid_indices[order]
-    sorted_r = flat_region[valid][order]
-    sorted_s = flat_sam3[valid][order]
-
-    boundaries = np.where(np.diff(sorted_r) | np.diff(sorted_s))[0] + 1
-    group_starts = np.concatenate([[0], boundaries])
-    group_ends = np.concatenate([boundaries, [len(sorted_idx)]])
-    group_r = sorted_r[group_starts]
-
-    unique_regions, sam3_counts = np.unique(group_r, return_counts=True)
-    regions_to_split = set(unique_regions[sam3_counts >= cfg.merge_threshold].tolist())
-
-    split_region_mask = np.isin(labeled_regions, list(regions_to_split))
-    out[split_region_mask] = 0
-
-    out_flat = out.ravel()
-    split_mask = np.isin(group_r, list(regions_to_split))
-
-    for start, end in zip(group_starts[split_mask], group_ends[split_mask]):
-        out_flat[sorted_idx[start:end]] = cfg.building_class_index
-
-    n_split = len(regions_to_split)
-    logger.info(f"regions split: {n_split}/{len(region_ids)}")
-
-    erode_radius_m = 0.5
-    shrink_px = max(1, round(erode_radius_m / cfg.gsd))
-    building_output = out == cfg.building_class_index
-    eroded_buildings = binary_erosion(building_output, iterations=shrink_px)
-    out[building_output & ~eroded_buildings] = 0
-
-    with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(out, 1)
-    logger.info(f"saved {out_path}")
-    return out_path
+    @classmethod
+    def from_sensor(cls, sensor_meta: dict) -> Optional["Config"]:
+        """Return a config when the sensor has area thresholds, else None."""
+        areas = sensor_meta.get("min_area_m2")
+        if not areas:
+            return None
+        labels = sensor_meta["class_labels"]
+        return cls(
+            building_class_index=(
+                int(labels["building"]) if "building" in labels else None
+            ),
+            road_class_index=int(labels["road"]) if "road" in labels else None,
+            gsd=sensor_meta["gsd"],
+            min_area_m2={int(k): float(v) for k, v in areas.items()},
+        )
 
 
 def clean_mask(
@@ -154,7 +55,7 @@ def clean_mask(
     training data via Config.from_stats(), so nothing is hardcoded.
 
     Args:
-        mask_path: path to the mask to clean (output of buildings_splitter or raw mask)
+        mask_path: path to the raw mask to clean
         cfg:       Config
 
     Returns:
@@ -176,7 +77,7 @@ def clean_mask(
         if cfg.road_class_index in cfg.min_area_m2
         else {}
     )
-
+    
     for class_idx, min_m2 in cfg.min_area_m2.items():
         min_px = max(1, int(min_m2 / cfg.gsd**2))
         binary = out == class_idx
