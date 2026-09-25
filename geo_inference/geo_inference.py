@@ -108,7 +108,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 0,
+        workers: int = 1,
         bbox: str = None,
     ) -> str:
 
@@ -143,7 +143,7 @@ class GeoInference:
         sensor_name: str = None,
         bands_requested: List[str] = [],
         patch_size: int = 1024,
-        workers: int = 0,
+        workers: int = 1,
         bbox: str = None,
     ) -> None:
         """
@@ -154,7 +154,8 @@ class GeoInference:
             sensor_name (str): The name of the sensor to use for the inference.
             bands_requested List[str]: The requested bands to consider for the inference.
             patch_size (int): The size of the patches to use for inference.
-            workers (int): Number of workers used by dask, Default = Nb of cores available on the host, minus 1.
+            workers (int): Number of workers used by dask. Default is 1.
+                Pass 0 to use the number of cores available on the host, minus 1.
             bbox (str): The bbox or extent of the image in this format "minx, miny, maxx, maxy".
 
         Returns:
