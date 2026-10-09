@@ -77,7 +77,9 @@ geo_inference -i <image> -br <bands_requested> -m <model> -wd <work_dir> -ps <pa
 - `-m`, `--model`: Path or URL to the model file
 - `-wd`, `--work_dir`: Working Directory
 - `-ps`, `--patch_size`: The patch Size, the size of dask chunks, Default = 1024
-- `-w`, `--workers`: Number of workers used by dask, Default = Nb of cores available on the host, minus 1
+- `-w`, `--workers`: Number of workers used by dask, Default = Nb of cores available on the host, minus 1 (at most 8 on GPU)
+- `-ppc`, `--patches_per_chunk`: Patches per Dask chunk and axis, inferred together in batches, Default = 4 on GPU, 1 on CPU
+- `-bs`, `--batch_size`: Max patches per forward pass, Default = derived from the patch size on GPU (16 at 512, 4 at 1024), capped by the model's export batch size
 - `-v`, `--vec`: Vector Conversion
 - `-y`, `--yolo`: Yolo Conversion
 - `-c`, `--coco`: Coco Conversion
@@ -148,6 +150,7 @@ Initiating the `GeoInference` class takes the following parameters:
 - `gpu_id`: The ID of the GPU to use for feature extraction. Default is `0`.
 - `num_classes`: The number of classes that the TorchScript model outputs. Default is `5`.
 - `prediction_threshold`: Prediction probability Threshold (fraction of 1) to use. Default is `0.3`.  
+- `batch_size`: Max patches per forward pass. Default is `0` = derived from the patch size on GPU, every patch of a chunk on CPU; capped by the model's export batch size.
 - `transformers`: Allow Test-time augmentations.  
 - `transformer_flip`: Perform horizontal and vertical flips.  
 - `transformer_rotate`: perform 90 degree rotation.  
@@ -156,7 +159,8 @@ Calling the GeoInference object takes the following parameters:
 - `inference_input`: Path to Geotiff. 
 - `bands_requested`: The requested bands from provided Geotiff (if not provided, it uses all bands).
 - `patch_size`: The patch size to use for feature extraction. Default is `1024`.
-- `workers`: Number of workers used by Dask, Default is `0` = Number of cores available on the host, minus 1.
+- `workers`: Number of workers used by Dask, Default is `0` = Number of cores available on the host, minus 1 (at most 8 on GPU, where forward passes are serialized).
+- `patches_per_chunk`: Patches per Dask chunk and axis. Default is `0` = 4 on GPU, 1 on CPU. Larger chunks mean bigger batches and fewer Dask tasks; the output is unchanged apart from float16 rounding.
 - `bbox`: AOI bbox in this format "minx, miny, maxx, maxy", in the image's crs. Default is `None`.
 
 

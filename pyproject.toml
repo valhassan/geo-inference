@@ -50,8 +50,8 @@ version = {file = ["VERSION"]}
 
 [project.optional-dependencies]
 cu128 = [
-  "torch>=2.8.0,<2.9.0",
-  "torchvision>=0.23.0,<0.24.0",
+  "torch>=2.9.0,<3.0.0",
+  "torchvision>=0.24.0,<1.0.0",
 ]
 dev = ["black", "bumpver", "isort", "pip-tools", "pytest"]
 
@@ -77,3 +77,23 @@ push = false
 "pyproject.toml" = [
     '^current_version = "{version}"',]
 "geo_inference/__init__.py" = ["{version}"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64"]
+
+# Use the PROJ/GDAL data bundled with the rasterio wheel, overriding any PROJ_DATA/GDAL_DATA
+# leaked from an outer conda env (a mismatched proj.db breaks CRS lookups).
+[tool.pixi.target.linux-64.activation.env]
+PROJ_DATA = "$CONDA_PREFIX/lib/python3.12/site-packages/rasterio/proj_data"
+GDAL_DATA = "$CONDA_PREFIX/lib/python3.12/site-packages/rasterio/gdal_data"
+
+[tool.pixi.dependencies]
+python = "==3.12.9"
+pytest = "==8.3.4"
+pytest-mock = "==3.14.1"
+pytest-cov = "==6.0.0"
+ruff = "==0.9.6"
+
+[tool.pixi.pypi-dependencies]
+geo-inference = { path = ".", editable = true, extras = ["cu128"] }

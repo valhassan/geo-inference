@@ -1,4 +1,5 @@
 import logging.config
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import yaml
 script_dir = Path(__file__).resolve().parent
 CONFIG_DIR = script_dir / "log_config.yaml"
 USER_CACHE = Path.home().joinpath(".cache")
-LOG_DIR = LOG_DIR = USER_CACHE.joinpath("geo-inference/logs")
+LOG_DIR = Path(os.environ.get("GEO_INFERENCE_LOG_DIR", USER_CACHE / "geo-inference/logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 timestamp = datetime.now().strftime("%Y%m%d-%H_%M_%S")
