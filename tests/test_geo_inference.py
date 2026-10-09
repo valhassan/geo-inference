@@ -19,7 +19,11 @@ class TestGeoInference:
 
     @pytest.fixture
     def geo_inference(self, test_data_dir, tmp_path):
-        model = str(test_data_dir / "inference" / "test_model" / "cpu_scripted.pt")
+        # GeoInference loads torch.export programs (.pt2); export a tiny 3-band, 5-class net.
+        net = torch.nn.Conv2d(3, 5, 3, padding=1).eval()
+        program = torch.export.export(net, (torch.randn(1, 3, 64, 64),))
+        model = str(tmp_path / "model.pt2")
+        torch.export.save(program, model, extra_files={"metadata.json": ""})
         work_dir = str(tmp_path / "inference")
         mask_to_vec = True
         mask_to_yolo = True
@@ -28,9 +32,6 @@ class TestGeoInference:
         gpu_id = 0
         num_classes = 5
         prediction_threshold = 0.3
-        transformer = True
-        transform_flip = True
-        transform_rotate = True
         return GeoInference(
             model=model,
             work_dir=work_dir,
@@ -42,9 +43,6 @@ class TestGeoInference:
             multi_gpu=False,
             num_classes=num_classes,
             prediction_threshold=prediction_threshold,
-            transformers=transformer,
-            transformer_flip=transform_flip,
-            transformer_rotate=transform_rotate,
         )
 
     def test_init(self, geo_inference, tmp_path):
@@ -54,7 +52,7 @@ class TestGeoInference:
         assert geo_inference.mask_to_vec == True
         assert geo_inference.mask_to_yolo == True
         assert geo_inference.mask_to_coco == True
-        assert isinstance(geo_inference.model.model, torch.jit.ScriptModule)
+        assert isinstance(geo_inference.model, torch.nn.Module)
         assert geo_inference.classes > 0
 
     def test_call_local_tif(self, geo_inference: GeoInference, test_data_dir: Path):

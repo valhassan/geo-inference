@@ -147,9 +147,9 @@ def test_cmd_interface_with_args(monkeypatch, test_data_dir):
                       "classes": 5,
                       "multi_gpu": False,
                       "prediction_threshold": 0.3,
-                      "transformers": False,
-                      "transformer_flip" : False,
-                      "transformer_rotate" : False,
+                      "post_inference": False,
+                      "patches_per_chunk": 0,
+                      "batch_size": 0,
                       "patch_size": 1024
                       }
 
@@ -174,9 +174,9 @@ def test_cmd_interface_with_image(monkeypatch):
         "gpu_id": 0,
         "classes": 5,
         "prediction_threshold": 0.3,
-        "transformers": False,
-        "transformer_flip" : False,
-        "transformer_rotate" : False,
+        "post_inference": False,
+        "patches_per_chunk": 0,
+        "batch_size": 0,
         "multi_gpu": False,
     }
 
