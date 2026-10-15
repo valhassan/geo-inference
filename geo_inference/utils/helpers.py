@@ -529,22 +529,6 @@ def cmd_interface(argv=None):
         help=("Perform post-inference operations."),
     )
 
-    parser.add_argument(
-        "-ppc",
-        "--patches_per_chunk",
-        type=int,
-        nargs=1,
-        help="Patches per Dask chunk and axis, Default = 4 on GPU, 1 on CPU",
-    )
-
-    parser.add_argument(
-        "-bs",
-        "--batch_size",
-        type=int,
-        nargs=1,
-        help="Max patches per forward pass, Default = derived from the patch size",
-    )
-
     args = parser.parse_args()
 
     if args.args:
@@ -569,8 +553,6 @@ def cmd_interface(argv=None):
         patch_size = config["arguments"]["patch_size"]
         prediction_threshold = config["arguments"]["prediction_thr"]
         post_inference = bool(config["arguments"].get("post_inference", False))
-        patches_per_chunk = int(config["arguments"].get("patches_per_chunk", 0))
-        batch_size = int(config["arguments"].get("batch_size", 0))
     elif args.image:
         image = args.image[0]
         model = args.model[0] if args.model else None
@@ -588,8 +570,6 @@ def cmd_interface(argv=None):
         patch_size = args.patch_size[0] if args.patch_size else 1024
         prediction_threshold = args.prediction_thr[0] if args.prediction_thr else 0.3
         post_inference = bool(args.post_inference)
-        patches_per_chunk = args.patches_per_chunk[0] if args.patches_per_chunk else 0
-        batch_size = args.batch_size[0] if args.batch_size else 0
     else:
         print("use the help [-h] option for correct usage")
         raise SystemExit
@@ -610,8 +590,6 @@ def cmd_interface(argv=None):
         "patch_size": patch_size,
         "prediction_threshold": prediction_threshold,
         "post_inference": post_inference,
-        "patches_per_chunk": patches_per_chunk,
-        "batch_size": batch_size,
     }
     return arguments
 

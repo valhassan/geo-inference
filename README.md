@@ -133,8 +133,6 @@ geo_inference -i <image> -br <bands_requested> -m <model> -wd <work_dir> -ps <pa
 - `-wd`, `--work_dir`: Working Directory
 - `-ps`, `--patch_size`: The patch Size, the size of dask chunks, Default = 1024
 - `-w`, `--workers`: Number of workers used by dask, Default = Nb of cores available on the host, minus 1 (at most 8 on GPU)
-- `-ppc`, `--patches_per_chunk`: Patches per Dask chunk and axis, inferred together in batches, Default = 4 on GPU, 1 on CPU
-- `-bs`, `--batch_size`: Max patches per forward pass, Default = derived from the patch size on GPU (16 at 512, 4 at 1024), capped by the model's export batch size
 - `-v`, `--vec`: Vector Conversion
 - `-y`, `--yolo`: Yolo Conversion
 - `-c`, `--coco`: Coco Conversion

@@ -148,8 +148,6 @@ def test_cmd_interface_with_args(monkeypatch, test_data_dir):
                       "multi_gpu": False,
                       "prediction_threshold": 0.3,
                       "post_inference": False,
-                      "patches_per_chunk": 0,
-                      "batch_size": 0,
                       "patch_size": 1024
                       }
 
@@ -175,8 +173,6 @@ def test_cmd_interface_with_image(monkeypatch):
         "classes": 5,
         "prediction_threshold": 0.3,
         "post_inference": False,
-        "patches_per_chunk": 0,
-        "batch_size": 0,
         "multi_gpu": False,
     }
 

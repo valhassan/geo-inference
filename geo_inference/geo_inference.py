@@ -216,7 +216,7 @@ class GeoInference:
             num_workers = max(1, min(MAX_GPU_WORKERS, num_cores - 1))
         else:
             num_workers = max(1, num_cores - 1)
-        num_workers =  31
+
         print(f"running dask with {num_workers} workers")
         config.set(scheduler="threads", num_workers=num_workers)
         config.set(pool=ThreadPool(num_workers))
