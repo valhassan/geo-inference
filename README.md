@@ -52,6 +52,61 @@ pip install geo-inference
 ### Docker installation
 Alternatively, you can build the [Dockerfile](./Dockerfile) to use Geo-Inference.  
 
+### Running locally with uv
+The development environment is managed with [uv](https://docs.astral.sh/uv/). The pinned Python version is in `.python-version` (3.12.9), and every dependency is locked in `uv.lock`.
+
+**1. Install uv** (once per machine). Use the [official installer](https://docs.astral.sh/uv/getting-started/installation/):
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+If pixi is already available, you can run `pixi global install uv` instead.
+
+> **HPC / small home quota:** uv keeps its cache and the Python builds it downloads under `~`. If your home directory is small, move them to a larger filesystem before you sync, for example in `~/.bashrc`:
+> ```shell
+> export UV_CACHE_DIR=/path/to/large/fs/.cache/uv
+> export UV_PYTHON_INSTALL_DIR=/path/to/large/fs/.local/share/uv/python
+> export PIXI_HOME=/path/to/large/fs/.pixi   # only if you installed uv with pixi
+> export PATH=$PIXI_HOME/bin:$PATH
+> ```
+
+**2. Create the environment.** Clone the repository and sync it:
+```shell
+git clone https://github.com/NRCan/geo-inference.git
+cd geo-inference
+uv sync --extra cu128
+```
+This creates `.venv`, installs Python 3.12.9 if needed, installs geo-inference in editable mode with CUDA 12.8 PyTorch, and adds the dev tools (pytest, pytest-mock, pytest-cov, ruff). Drop `--extra cu128` to get torch from PyPI instead of the CUDA 12.8 index.
+
+**3. Run the project.** `uv run` runs a command inside `.venv` without activating it, and syncs the environment first if `pyproject.toml` or `uv.lock` changed:
+```shell
+uv run geo_inference -h                                   # list CLI arguments
+uv run geo_inference -a geo_inference/config/sample.yaml  # run from a yaml config
+uv run geo_inference -i /path/to/image.tif -m /path/to/model.pt -wd /path/to/work_dir -br 1 2 3 -d gpu
+uv run python examples/test.py                            # run a script
+uv run jupyter lab                                        # open the example notebooks
+```
+You can also activate the environment and use the commands directly:
+```shell
+source .venv/bin/activate
+geo_inference -h
+```
+
+**4. Run the tests and linter:**
+```shell
+uv run pytest
+uv run ruff check .
+```
+
+**5. Manage dependencies.** Edit dependencies through uv so that `uv.lock` stays in sync, and commit both `pyproject.toml` and `uv.lock`:
+```shell
+uv add <package>            # add a runtime dependency
+uv add --dev <package>      # add a dev-only dependency
+uv remove <package>
+uv lock --upgrade           # refresh locked versions within the allowed ranges
+```
+
+> **Note:** geo-inference points `PROJ_DATA` and `GDAL_DATA` at the data bundled with the rasterio wheel when it is imported. This prevents mismatched PROJ databases from an outer conda environment (for example a `(base)` env left active) from breaking CRS lookups.
+
 ## Usage
 
 **Input:** GeoTiffs with compatible TorchScript model. For example: A pytorch model trained on high resolution geospatial imagery with the following features:
